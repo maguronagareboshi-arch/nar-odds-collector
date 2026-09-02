@@ -20,8 +20,15 @@ def main():
     ap.add_argument("--every", type=int, default=120)
     ap.add_argument("--before", type=int, default=40)
     ap.add_argument("--after", type=int, default=8)
+    ap.add_argument("--start", type=int, default=9 * 60 + 30, help="この時刻(JST 分)より前に起動したら何もしない")
     a = ap.parse_args()
     until = int(a.until[:2]) * 60 + int(a.until[2:])
+    # 深夜〜早朝に(遅れて)起動した回は何もせず終わる= 6 時間の枠を空回りで使い切り、朝の回を待たせないため
+    # (実測 2026-09-03 01:39 JST に schedule が着火し、until=2200 で回り続けていた)
+    now = dt.datetime.now(JST)
+    if now.hour * 60 + now.minute < a.start:
+        print(f"[{now:%H:%M:%S}] 開始時刻 {a.start // 60:02d}:{a.start % 60:02d} より前なので終了", flush=True)
+        return 0
     n = 0
     while True:
         now = dt.datetime.now(JST)
