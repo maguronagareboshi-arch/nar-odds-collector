@@ -1,17 +1,24 @@
-# 当日オッズ(単複+全券種)を 2 分おきに取る。1 ジョブが最長 6 時間なので、昼の便と夜の便の 2 本で JST 10:00〜22:00 を覆う。
+# 当日オッズ(単複+全券種)を 2 分おきに取る。1 ジョブが最長 6 時間なので、昼の便(〜16:00)と夜の便(〜22:00)に分けて JST 10:00〜22:00 を覆う。
 # 公開リポジトリなので Actions の分数は無制限。手動実行は until(JST HHMM)を指定できる。
 # Secrets: SUPABASE_URL / SUPABASE_SERVICE_KEY(任意: COLLECTOR_UA)
 name: collect
+# 起動の保険: GitHub の schedule は遅れたり抜けたりするので、JST 09:58〜21:58 の 20 分おきに全部起こす。
+# 同時に走るのは 1 本だけ(走行中なら後続は 1 本だけ待機し、前の便が終わった時点で後を継ぐ。
+# 終了時刻を過ぎていれば loop.py がすぐ終わる)。→ どれか 1 本でも起きればループが続く。
 on:
   schedule:
-    - cron: '58 0 * * *'    # JST 09:58 -> 16:00 まで(昼の便)
-    - cron: '58 6 * * *'    # JST 15:58 -> 22:00 まで(夜の便)
+    - cron: '58 0-12 * * *'   # JST 09:58, 10:58, ... 21:58
+    - cron: '18 1-12 * * *'   # JST 10:18, ... 21:18
+    - cron: '38 1-12 * * *'   # JST 10:38, ... 21:38
   workflow_dispatch:
     inputs:
       until:
         description: 'JST HHMM until (empty: 1600 before 16:00, else 2200)'
         required: false
         default: ''
+concurrency:
+  group: collect
+  cancel-in-progress: false
 permissions:
   contents: read
 jobs:
