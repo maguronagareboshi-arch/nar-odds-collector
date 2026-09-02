@@ -23,6 +23,37 @@ ODDS_URL = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/OddsTanFuku"
 SLEEP = 1.0
 TABLE = "nar_race_odds"
 CONFLICT = "track,race_date,race_no"
+TICKS = "nar_odds_ticks"       # 2 分刻み(insert only・1 巡回 1 行)
+HIST_GAP_MIN = 15              # history(約 20 分粒度)へ追記する最小間隔(分)
+
+
+def _minutes_between(a, b):
+    """'HH:MM' 2 つの差(分)。読めなければ None。日付をまたぐ場合は当日内の前後関係で扱う。"""
+    try:
+        ha, ma = int(a[:2]), int(a[3:5])
+        hb, mb = int(b[:2]), int(b[3:5])
+    except (TypeError, ValueError):
+        return None
+    d = (hb * 60 + mb) - (ha * 60 + ma)
+    return d if d >= 0 else d + 24 * 60
+
+
+def insert(url, key, table, rows):
+    """PostgREST の insert(重複解決なし)。"""
+    import json as _json
+    import urllib.error as _err
+    import urllib.request as _req
+    body = _json.dumps(rows, ensure_ascii=False).encode("utf-8")
+    req = _req.Request(f"{url}/rest/v1/{table}", data=body, method="POST",
+                       headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                                "Prefer": "return=minimal"})
+    try:
+        with _req.urlopen(req, timeout=60) as r:
+            return r.status, ""
+    except _err.HTTPError as e:
+        return e.code, e.read().decode()[:300]
+    except Exception as e:
+        return 0, str(e)
 
 
 def odds_url(date, race_no, baba):
@@ -139,7 +170,7 @@ def main():
         f"最終済み {sum(1 for r in finals if r.get('is_final'))} は除く)")
     if not targets:
         return 0
-    rows, ok, ng, empty = [], 0, 0, 0
+    rows, ticks, ok, ng, empty = [], [], 0, 0, 0
     for i, t in enumerate(targets):
         if i:
             time.sleep(SLEEP)
@@ -155,15 +186,26 @@ def main():
             log(f"  発売前/表なし {t['track']} {t['race_no']}R(発走まで {t['delta']} 分)")
             continue
         ok += 1
-        # 履歴= 単勝だけを時刻付きで最大 12 件(超えたら中間を捨て、最初と直近を残す)
+        now_j = dt.datetime.now(JST)
+        hhmm = now_j.strftime("%H:%M")
+        wmap = {str(x["n"]): x["w"] for x in runners if x["w"] is not None}
+        # 2 分刻み(nar_odds_ticks)= 1 巡回 1 行を足すだけ(insert only)
+        tick = {"track": t["track"], "race_date": date.isoformat(), "race_no": t["race_no"], "t": hhmm,
+                "f": bool(is_final), "w": wmap,
+                "p": {str(x["n"]): [x["pl"], x["ph"]] for x in runners if x["pl"] is not None}}
+        ticks.append(tick)
+        # 履歴(history)= 約 20 分粒度の約束を守る: 前の記録から 15 分以上あいたとき(または最終の初回)だけ追記。
+        # 最大 12 件(超えたら中間を捨て、最初と直近を残す)
         hist = list(hist_by.get((t["track"], t["race_no"]), []))
-        entry = {"t": dt.datetime.now(JST).strftime("%H:%M"),
-                 "w": {str(x["n"]): x["w"] for x in runners if x["w"] is not None}}
-        if is_final:
-            entry["f"] = 1
-        hist.append(entry)
-        while len(hist) > 12:
-            hist.pop(1)
+        last = hist[-1] if hist else None
+        gap = _minutes_between(last.get("t") if last else None, hhmm)
+        if last is None or gap is None or gap >= HIST_GAP_MIN or (is_final and not last.get("f")):
+            entry = {"t": hhmm, "w": wmap}
+            if is_final:
+                entry["f"] = 1
+            hist.append(entry)
+            while len(hist) > 12:
+                hist.pop(1)
         now_utc = dt.datetime.now(dt.timezone.utc).isoformat()
         rows.append({"track": t["track"], "race_date": date.isoformat(), "race_no": t["race_no"],
                      "observed_at": now_utc, "is_final": is_final, "runners": runners, "history": hist,
@@ -181,6 +223,13 @@ def main():
         log(f"投入失敗 status={status} {msg}")
         return 1
     log(f"投入 {len(rows)} 行 -> {TABLE}")
+    # 2 分刻みは別の表へ(insert)。表がまだ無い等で落ちても単複本体は入っているので rc は 0 のまま(ログに残す)
+    if ticks:
+        st2, msg2 = insert(url, key, TICKS, ticks)
+        if st2 >= 300 or st2 == 0:
+            log(f"⚠{TICKS} の追記に失敗 status={st2} {msg2}")
+        else:
+            log(f"追記 {len(ticks)} 行 -> {TICKS}")
     return 0
 
 
