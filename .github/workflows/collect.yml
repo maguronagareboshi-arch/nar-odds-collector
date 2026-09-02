@@ -1,27 +1,36 @@
-# 当日オッズ(全券種)の収集。JST 09:07〜21:47 を 20 分おき。公開リポジトリなので Actions の分数は無制限。
+# 当日オッズ(単複+全券種)を 2 分おきに取る。1 ジョブが最長 6 時間なので、昼の便と夜の便の 2 本で JST 10:00〜22:00 を覆う。
+# 公開リポジトリなので Actions の分数は無制限。手動実行は until(JST HHMM)を指定できる。
 # Secrets: SUPABASE_URL / SUPABASE_SERVICE_KEY(任意: COLLECTOR_UA)
 name: collect
 on:
   schedule:
-    - cron: '7,27,47 0-12 * * *'
+    - cron: '58 0 * * *'    # JST 09:58 -> 16:00 まで(昼の便)
+    - cron: '58 6 * * *'    # JST 15:58 -> 22:00 まで(夜の便)
   workflow_dispatch:
-concurrency:
-  group: collect
-  cancel-in-progress: false
+    inputs:
+      until:
+        description: 'JST HHMM until (empty: 1600 before 16:00, else 2200)'
+        required: false
+        default: ''
 permissions:
   contents: read
 jobs:
   odds:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 365
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: odds full
+      - name: loop (every 2 min)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
-        run: python odds_full.py
+          UNTIL_IN: ${{ github.event.inputs.until }}
+        run: |
+          H=$(TZ=Asia/Tokyo date +%H%M)
+          if [ -n "$UNTIL_IN" ]; then U="$UNTIL_IN"; elif [ $((10#$H)) -lt 1600 ]; then U=1600; else U=2200; fi
+          echo "JST $H -> $U"
+          python loop.py --until "$U"
