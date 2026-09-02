@@ -1,0 +1,27 @@
+# 当日オッズ(全券種)の収集。JST 09:07〜21:47 を 20 分おき。公開リポジトリなので Actions の分数は無制限。
+# Secrets: SUPABASE_URL / SUPABASE_SERVICE_KEY(任意: COLLECTOR_UA)
+name: collect
+on:
+  schedule:
+    - cron: '7,27,47 0-12 * * *'
+  workflow_dispatch:
+concurrency:
+  group: collect
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  odds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: odds full
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
+        run: python odds_full.py
