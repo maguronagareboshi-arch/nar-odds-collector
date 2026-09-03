@@ -8,6 +8,7 @@
 終了コード: 0 正常 / 1 投入失敗 / 2 前提の読み取りに失敗
 
 行の形: {track, race_date, race_no, observed_at, is_final, runners:[{n,w,pl,ph}], history:[{t,w,f?}], updated_at}
+2 分刻みの行: {track, race_date, race_no, t(取得時刻), asof(ページに書かれた時刻), f, w, p}
 """
 import argparse
 import datetime as dt
@@ -25,6 +26,9 @@ TABLE = "nar_race_odds"
 CONFLICT = "track,race_date,race_no"
 TICKS = "nar_odds_ticks"       # 2 分刻み(insert only・1 巡回 1 行)
 HIST_GAP_MIN = 15              # history(約 20 分粒度)へ追記する最小間隔(分)
+# 見出し「単勝・複勝 オッズ （18:53 現在）」の時刻。全角/半角のカッコと空白の揺れを許す。
+# 最終オッズの見出しは「（最終）」で時刻が入らない= その回は None(取得時刻 t は別に残る)
+ASOF_RE = re.compile(r"(\d{1,2}):(\d{2})\s*現在")
 
 
 def _minutes_between(a, b):
@@ -84,13 +88,17 @@ def header_cols(thead):
 
 
 def parse_odds(page):
-    """単複ページ → (runners, is_final)。表が無ければ (None, False)。"""
+    """単複ページ → (runners, is_final, asof)。表が無ければ (None, False, None)。
+    asof は見出しに書かれた「HH:MM 現在」(取得時刻とは 1〜7 分ずれる)。"""
     m = re.search(r'<table[^>]*class="[^"]*odd_popular_table_02[^"]*"[^>]*>(.*?)</table>', page, re.S)
     if not m:
-        return None, False
+        return None, False, None
     table = m.group(1)
     title = re.search(r'class="odd_title"[^>]*>(.*?)</h4>', page, re.S)
-    is_final = "最終" in _text(title.group(1)) if title else False
+    head = _text(title.group(1)) if title else ""
+    is_final = "最終" in head
+    am = ASOF_RE.search(head)
+    asof = f"{int(am.group(1)):02d}:{am.group(2)}" if am else None
     thead = re.search(r"<thead[^>]*>(.*?)</thead>", table, re.S)
     cols = header_cols(thead.group(1) if thead else "")
     body = re.search(r"<tbody[^>]*>(.*?)</tbody>", table, re.S)
@@ -114,8 +122,8 @@ def parse_odds(page):
         runners.append({"n": int(n), "w": _num(tds[cols["win"]]), "pl": pl, "ph": ph})
     nums = [x["n"] for x in runners]
     if nums != sorted(nums) or nums != list(range(1, len(nums) + 1)):
-        return None, is_final
-    return (runners or None), is_final
+        return None, is_final, asof
+    return (runners or None), is_final, asof
 
 
 def pick_targets(races, finals, now_min, before, after, limit):
@@ -180,7 +188,7 @@ def main():
             ng += 1
             log(f"  取得失敗 {t['track']} {t['race_no']}R: {type(e).__name__}: {str(e)[:120]}")
             continue
-        runners, is_final = parse_odds(page)
+        runners, is_final, asof = parse_odds(page)
         if not runners or all(x["w"] is None for x in runners):
             empty += 1
             log(f"  発売前/表なし {t['track']} {t['race_no']}R(発走まで {t['delta']} 分)")
@@ -191,7 +199,7 @@ def main():
         wmap = {str(x["n"]): x["w"] for x in runners if x["w"] is not None}
         # 2 分刻み(nar_odds_ticks)= 1 巡回 1 行を足すだけ(insert only)
         tick = {"track": t["track"], "race_date": date.isoformat(), "race_no": t["race_no"], "t": hhmm,
-                "f": bool(is_final), "w": wmap,
+                "asof": asof, "f": bool(is_final), "w": wmap,
                 "p": {str(x["n"]): [x["pl"], x["ph"]] for x in runners if x["pl"] is not None}}
         ticks.append(tick)
         # 履歴(history)= 約 20 分粒度の約束を守る: 前の記録から 15 分以上あいたとき(または最終の初回)だけ追記。
@@ -211,7 +219,8 @@ def main():
                      "observed_at": now_utc, "is_final": is_final, "runners": runners, "history": hist,
                      "updated_at": now_utc})
         low = min((x["w"] for x in runners if x["w"] is not None), default=None)
-        log(f"  {t['track']} {t['race_no']}R {len(runners)}頭 単勝最低 {low}{' (最終)' if is_final else ''}")
+        log(f"  {t['track']} {t['race_no']}R {len(runners)}頭 単勝最低 {low}"
+            f" 取得 {hhmm} / ページ {asof or '-'}{' (最終)' if is_final else ''}")
     log(f"取得 成功 {ok} / 失敗 {ng} / 発売前 {empty} / 最終化 {sum(1 for r in rows if r['is_final'])}")
     if args.dry_run:
         log("dry-run: 投入しない")

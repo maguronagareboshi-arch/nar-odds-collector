@@ -4,6 +4,10 @@
   python loop.py --until 2200      # JST 22:00 まで(HHMM)。--every 秒(既定 120)
 対象は「発走 40 分前〜8 分後」に絞る(発走が近いレースを密に、遠いレースは取らない)。
 最終オッズが揃ったレースは各スクリプトが自分で飛ばす。1 周が --every 秒より長ければ、間を置かず次の周へ。
+
+2 分ごとに要らないものは、周回を間引いて回す(オッズの 2 分刻みを遅らせないため):
+  post_time_refresh.py … 5 周に 1 回(約 10 分)。発走時刻は当日ずれることがある。
+  sales_rakuten.py     … 3 周に 1 回(約 6 分)・1 回 1 場。取得元が Crawl-Delay: 60 なので続けて取らない。
 """
 import argparse
 import datetime as dt
@@ -43,6 +47,16 @@ def main():
                                   "--limit", "40"])
             if rc:
                 print(f"  {script} rc={rc}(次の周で取り直す)", flush=True)
+        # 間引いて回すもの(落ちても次の周に任せる= オッズ本体は止めない)
+        extra = []
+        if n % 5 == 1:
+            extra.append(["post_time_refresh.py"])
+        if n % 3 == 2:
+            extra.append(["sales_rakuten.py", "--max-tracks", "1"])
+        for cmd in extra:
+            rc = subprocess.call([sys.executable] + cmd)
+            if rc:
+                print(f"  {cmd[0]} rc={rc}(次の周で取り直す)", flush=True)
         wait = a.every - (time.time() - t0)
         if wait > 0:
             time.sleep(wait)
