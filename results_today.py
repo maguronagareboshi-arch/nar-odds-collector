@@ -21,11 +21,25 @@ import sys
 import time
 from pathlib import Path
 
-from nar_official_csv import digest_bytes, download_archive, download_url, normalize_archive
+import urllib.request
+
+from nar_official_csv import UA, digest_bytes, download_url, normalize_archive
 from load_nar_official import build_dedup, load_env, upsert_all
 
 JST = dt.timezone(dt.timedelta(hours=9))
 STATE = Path(".results_state.json")      # ジョブの作業フォルダに置く(同じジョブの中だけ持ち越す)
+
+
+def download_archive(url, timeout=90):
+    """nar_official_csv.download_archive と同じ判定を urllib で(⛔このリポは標準ライブラリだけ= requests が無い。
+    2026-09-05 実測: クラウドで ModuleNotFoundError)。ZIP でなければ ValueError。"""
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/zip,*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        payload = r.read()
+        final = str(r.geturl())
+    if len(payload) < 4 or payload[:2] != b"PK":
+        raise ValueError("NAR download did not return a ZIP archive")
+    return payload, final
 
 
 def log(msg):
