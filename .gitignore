@@ -1,4 +1,2 @@
-.env*
+.results_state.json
 __pycache__/
-fixtures/
-.state_sales.json

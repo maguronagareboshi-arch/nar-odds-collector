@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""2 分おきに odds_tanfuku.py と odds_full.py を回す(GitHub Actions の 1 ジョブで最長 6 時間)。
+"""2 分おきに odds_tanfuku.py と odds_full.py(と当日の確定結果 results_today.py)を回す(GitHub Actions の 1 ジョブで最長 6 時間)。
 
   python loop.py --until 2200      # JST 22:00 まで(HHMM)。--every 秒(既定 120)
 対象は「発走 40 分前〜8 分後」に絞る(発走が近いレースを密に、遠いレースは取らない)。
@@ -48,7 +48,8 @@ def main():
             if rc:
                 print(f"  {script} rc={rc}(次の周で取り直す)", flush=True)
         # 間引いて回すもの(落ちても次の周に任せる= オッズ本体は止めない)
-        extra = []
+        # 当日の確定結果・払戻(results_today.py)は毎周= 公式 ZIP は発走 6〜9 分後に載る。変化が無ければ 0.3 秒で戻る
+        extra = [["results_today.py"]]
         if n % 5 == 1:
             extra.append(["post_time_refresh.py"])
         if n % 3 == 2:
