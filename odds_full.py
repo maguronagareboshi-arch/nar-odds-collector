@@ -296,6 +296,74 @@ def combos_json(kind, rows):
     return [list(nums) + [odds, rank] for nums, odds, rank in rows]
 
 
+# ---------------------------------------------------------------- 1着固定の合成オッズ(§123)
+
+TICKS = "nar_odds_ticks"        # 2 分刻みの行(odds_tanfuku.py が同じ周回で 1 行入れる)。ここは u1/s1 を書き足すだけ
+SYNTH_MAX_AGE_MIN = 4           # 直近の tick がこれより古ければ書かない(別の周回の行に付けない)
+
+
+def synth_first(got):
+    """その馬が 1 着の組を全部同じ額で買ったときの倍率= 1 / Σ(1/オッズ)。{馬番: 小数1桁}。
+    got= parse_ranking の行 [(nums, odds, rank)]。オッズ 0 以下・数でないものは足さない(発売の無い組)。"""
+    acc = {}
+    for nums, odds, _rank in got:
+        try:
+            o = float(odds)
+        except (TypeError, ValueError):
+            continue
+        if o <= 0 or not nums:
+            continue
+        acc[int(nums[0])] = acc.get(int(nums[0]), 0.0) + 1.0 / o
+    return {str(k): round(1.0 / v, 1) for k, v in acc.items() if v > 0}
+
+
+def _minutes_since(hhmm, now):
+    try:
+        h, m = int(hhmm[:2]), int(hhmm[3:5])
+    except (TypeError, ValueError):
+        return None
+    d = (now.hour * 60 + now.minute) - (h * 60 + m)
+    return d if d >= 0 else d + 24 * 60
+
+
+def patch(url, key, path, body):
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(f"{url}/rest/v1/{path}", data=data, method="PATCH",
+                                 headers={"apikey": key, "Authorization": f"Bearer {key}",
+                                          "Content-Type": "application/json", "Prefer": "return=minimal",
+                                          "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, ""
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()[:300]
+    except Exception as e:
+        return 0, str(e)
+
+
+def attach_synth(url, key, date, target, synth, now):
+    """同じ周回の tick(直近 1 行・u1 が空)に u1/s1 を書き足す。無ければ何もしない(単複の行が無い= 窓の外)。"""
+    if not synth:
+        return "なし"
+    try:
+        rows = sb_get(url, key, f"{TICKS}?select=id,t,u1&track=eq.{urllib.parse.quote(target['track'])}"
+                                f"&race_date=eq.{date.isoformat()}&race_no=eq.{target['race_no']}&order=id.desc&limit=1")
+    except Exception as e:
+        return f"tick 読めず {type(e).__name__}"
+    if not rows:
+        return "tick なし"
+    row = rows[0]
+    if row.get("u1") is not None:
+        return "済み"
+    age = _minutes_since(str(row.get("t") or ""), now)
+    if age is None or age > SYNTH_MAX_AGE_MIN:
+        return f"tick が古い({row.get('t')})"
+    status, msg = patch(url, key, f"{TICKS}?id=eq.{row['id']}", synth)
+    if status >= 300 or status == 0:
+        return f"書けず status={status} {msg}"
+    return f"OK id={row['id']} t={row.get('t')} 馬 {len(synth.get('u1') or {})}/{len(synth.get('s1') or {})}"
+
+
 # ---------------------------------------------------------------- 1レースぶん
 
 def save_page(save_dir, path, page):
@@ -310,6 +378,7 @@ def fetch_race(date, target, save_dir=None):
     rows = []
     st = {"ok": 0, "ng": 0, "empty": 0, "absent": 0, "reject": 0, "final": 0}
     head = None
+    synth = {}                                   # §123 {"u1": {馬番: 馬単1着合成}, "s1": {馬番: 3連単1着合成}}
     if save_dir:
         # 見本一式には単複のページも揃える。ここでは解析も投入もしない
         try:
@@ -373,7 +442,11 @@ def fetch_race(date, target, save_dir=None):
         rows.append({"track": target["track"], "race_date": date.isoformat(),
                      "race_no": target["race_no"], "kind": kind, "observed_at": now_utc,
                      "is_final": is_final, "combos": combos_json(kind, got), "updated_at": now_utc})
-    return rows, st, head
+        if kind == "umatan":
+            synth["u1"] = synth_first(got)
+        elif kind == "sanrentan":
+            synth["s1"] = synth_first(got)
+    return rows, st, head, synth
 
 
 # ---------------------------------------------------------------- 本体
@@ -438,10 +511,15 @@ def main():
             time.sleep(SLEEP)
         log(f"  {t['track']} {t['race_no']}R(発走まで {t['delta']} 分)")
         save = (Path(args.save_fixtures) / f"{t['track']}_{t['race_no']}R") if args.save_fixtures else None
-        got, st, head = fetch_race(date, t, save_dir=save)
+        got, st, head, synth = fetch_race(date, t, save_dir=save)
         if save:
             log(f"    生HTMLを保存: {save}({head} 頭)")
         rows.extend(got)
+        if synth:
+            t["synth"] = synth
+            u1, s1 = synth.get("u1") or {}, synth.get("s1") or {}
+            top = sorted(u1.items(), key=lambda kv: kv[1])[:3]
+            log(f"    1着固定の合成 馬単 {len(u1)}頭 / 3連単 {len(s1)}頭 先頭3頭 {top}")
         for k in tot:
             tot[k] += st[k]
 
@@ -457,6 +535,10 @@ def main():
         log(f"投入失敗 status={status} {msg}")
         return 1
     log(f"投入 {len(rows)} 行 -> {TABLE}")
+    # §123 同じ周回の 2 分刻みの行(odds_tanfuku.py が先に入れている)に 1着固定の合成を書き足す
+    for t in targets:
+        if t.get("synth"):
+            log(f"  合成→{TICKS} {t['track']} {t['race_no']}R: {attach_synth(url, key, date, t, t['synth'], now)}")
     return 0
 
 
