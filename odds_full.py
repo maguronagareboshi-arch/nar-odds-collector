@@ -314,6 +314,19 @@ def parse_waku(page):
     return out
 
 
+def has_odds(rows):
+    """その券種の行に「0 より大きいオッズ」が 1 つでもあるか。⛔全部 0.0 の板は発売していない。
+
+    受けるのは 人気順の行 (組, オッズ, 人気) と 枠連の行 [枠, 枠, オッズ] の両方。
+    ⛔「一部の組だけ 0.0」(その組だけ売っていない)は真= 今までどおり通す。偽は**全部 0** のときだけ。
+    """
+    for r in rows or []:
+        odds = r[1] if isinstance(r[0], (tuple, list)) else r[-1]
+        if odds is not None and float(odds) > 0:
+            return True
+    return False
+
+
 def combos_json(kind, rows):
     """保存形。2連系 [[a,b,odds,rank]] / 3連系 [[a,b,c,odds,rank]] / 枠連 [[i,j,odds]]。"""
     if kind in ("wakuren", "wakutan"):
@@ -472,6 +485,10 @@ def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
                     st["empty"] += 1
                     log(f"    発売前/表なし {KIND_LABEL[kind]}")
                     continue
+                if not has_odds(got):
+                    st["empty"] += 1
+                    log(f"    全組 0.0 {KIND_LABEL[kind]}(発売なし= 中止か)")
+                    continue
                 st["ok"] += 1
                 st["final"] += 1 if is_final else 0
                 log(f"    {KIND_LABEL[kind]} {len(got)}組{' (最終)' if is_final else ''} 先頭3組 {got[:3]}")
@@ -487,6 +504,11 @@ def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
         if not got:
             st["empty"] += 1
             log(f"    発売前/表なし {KIND_LABEL[kind]}")
+            continue
+        if not has_odds(got):
+            # ⛔検算より前に置く。全組 0.0 の板は組数が全通りと合うので runners_for_count は通ってしまう
+            st["empty"] += 1
+            log(f"    全組 0.0 {KIND_LABEL[kind]}(発売なし= 中止か)")
             continue
         m = runners_for_count(kind, len(got), head)
         if m is None:
