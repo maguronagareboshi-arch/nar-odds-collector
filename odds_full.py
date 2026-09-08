@@ -7,10 +7,12 @@ Supabase の表 nar_odds_full へ保存する収集ジョブ。標準ライブ�
 環境変数: SUPABASE_URL / SUPABASE_SERVICE_KEY(GitHub Secrets)。COLLECTOR_UA で User-Agent を上書きできる。
 終了コード: 0 正常(対象なし・一部の取得失敗も 0=次の実行に任せる)/ 1 投入失敗 / 2 前提の読み取りに失敗
 
-前提の表(nar_races: track,race_no,post_time / nar_odds_full: track,race_date,race_no,kind,observed_at,is_final,combos)
+前提の表(nar_races: track,race_no,post_time / nar_odds_full: track,race_date,race_no,kind,observed_at,is_final,combos,h
+          / nar_odds_full_ticks: 同じ鍵 + observed_at で 1 行= 中身が変わった周回だけ積む)
 """
 import argparse
 import datetime as dt
+import hashlib
 import html as html_mod
 import json
 import os
@@ -82,6 +84,28 @@ def upsert(url, key, table, conflict, rows):
             return 0, str(e)
 
 
+def insert(url, key, table, rows):
+    """PostgREST の INSERT(重ねない)。同じ鍵の行が既にあれば 409 が返る= 呼び手が読み分ける。"""
+    body = json.dumps(rows, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{url}/rest/v1/{table}", data=body, method="POST",
+        headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                 "Prefer": "return=minimal", "User-Agent": UA})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, ""
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode()[:300]
+            if e.code >= 500 and attempt < 2:
+                time.sleep(3 * (attempt + 1)); continue
+            return e.code, msg
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1)); continue
+            return 0, str(e)
+
+
 def _text(fragment):
     """タグを落として1行の文字列に。"""
     s = re.sub(r"<[^>]+>", " ", fragment)
@@ -124,6 +148,7 @@ def pick_targets(races, finals, now_min, before, after, limit):
 BASE = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo"
 TABLE = "nar_odds_full"
 CONFLICT = "track,race_date,race_no,kind"
+FULL_TICKS = "nar_odds_full_ticks"   # 上書きせず積む表(同じ鍵 + observed_at で 1 行)
 SLEEP = 1.0            # 1リクエストの間隔(秒)。公式サイトへの負荷を抑える
 
 # 公式ページ(パス) → そのページから採れる券種。枠連のページだけ1ページで2種
@@ -296,6 +321,31 @@ def combos_json(kind, rows):
     return [list(nums) + [odds, rank] for nums, odds, rank in rows]
 
 
+def combos_h(kind, rows):
+    """その券種の中身の指紋= combos_json の md5(16進 32 桁)。
+
+    ⛔直列化は投入に渡すものと**同じ引数**(json.dumps(..., ensure_ascii=False))に揃える。
+    公式ページは 2 分より粗く更新することがあるので、前の周回と同じ指紋なら全点の表には積まない。
+    """
+    body = json.dumps(combos_json(kind, rows), ensure_ascii=False)
+    return hashlib.md5(body.encode("utf-8")).hexdigest()
+
+
+def rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h):
+    """1 券種ぶんの (最新の行, 全点の行)。中身が前の周回と同じで最終でもなければ全点は None。
+
+    ⛔最終(is_final)は指紋が同じでも 1 回だけ積む(最終が揃ったレースは以後 pick_targets から外れる)。
+    """
+    combos = combos_json(kind, got)
+    h = combos_h(kind, got)
+    key = {"track": target["track"], "race_date": date.isoformat(),
+           "race_no": target["race_no"], "kind": kind, "observed_at": now_utc}
+    row = dict(key, is_final=is_final, combos=combos, h=h, updated_at=now_utc)
+    if h == prev_h.get((target["track"], target["race_no"], kind)) and not is_final:
+        return row, None
+    return row, dict(key, f=is_final, h=h, combos=combos)
+
+
 # ---------------------------------------------------------------- 1着固定の合成オッズ(§123)
 
 TICKS = "nar_odds_ticks"        # 2 分刻みの行(odds_tanfuku.py が同じ周回で 1 行入れる)。ここは u1/s1 を書き足すだけ
@@ -372,11 +422,15 @@ def save_page(save_dir, path, page):
     p.write_text(page, encoding="utf-8")
 
 
-def fetch_race(date, target, save_dir=None):
-    """1レースの6ページを取り、券種ごとの行にする。→ (rows, stats, 頭数)。rows は upsert 用の dict。"""
-    now_utc = dt.datetime.now(dt.timezone.utc).isoformat()
-    rows = []
-    st = {"ok": 0, "ng": 0, "empty": 0, "absent": 0, "reject": 0, "final": 0}
+def fetch_race(date, target, save_dir=None, prev_h=None):
+    """1レースの6ページを取り、券種ごとの行にする。→ (rows, stats, 頭数, 合成, 全点)。
+
+    rows= nar_odds_full の upsert 用(最新1行)・ticks= nar_odds_full_ticks の insert 用(中身が変わった券種だけ)。
+    """
+    now_utc = dt.datetime.now(dt.timezone.utc).isoformat()   # このレースの 7 券種はこの 1 つを共有する
+    prev_h = prev_h or {}
+    rows, ticks = [], []
+    st = {"ok": 0, "ng": 0, "empty": 0, "absent": 0, "reject": 0, "final": 0, "same": 0}
     head = None
     synth = {}                                   # §123 {"u1": {馬番: 馬単1着合成}, "s1": {馬番: 3連単1着合成}}
     if save_dir:
@@ -417,10 +471,12 @@ def fetch_race(date, target, save_dir=None):
                 st["ok"] += 1
                 st["final"] += 1 if is_final else 0
                 log(f"    {KIND_LABEL[kind]} {len(got)}組{' (最終)' if is_final else ''} 先頭3組 {got[:3]}")
-                rows.append({"track": target["track"], "race_date": date.isoformat(),
-                             "race_no": target["race_no"], "kind": kind, "observed_at": now_utc,
-                             "is_final": is_final, "combos": combos_json(kind, got),
-                             "updated_at": now_utc})
+                row, tick = rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h)
+                rows.append(row)
+                if tick is None:
+                    st["same"] += 1
+                else:
+                    ticks.append(tick)
             continue
         kind = kinds[0]
         got, dropped = parse_ranking(page)
@@ -439,14 +495,17 @@ def fetch_race(date, target, save_dir=None):
         scratched = "" if m == head else f"・取消 {head - m} 頭とみなす"
         log(f"    {KIND_LABEL[kind]} {len(got)}組 = {m}頭の全通り{scratched}"
             f"{' (最終)' if is_final else ''} 先頭3組 {[(list(a), o, r) for a, o, r in got[:3]]}")
-        rows.append({"track": target["track"], "race_date": date.isoformat(),
-                     "race_no": target["race_no"], "kind": kind, "observed_at": now_utc,
-                     "is_final": is_final, "combos": combos_json(kind, got), "updated_at": now_utc})
+        row, tick = rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h)
+        rows.append(row)
+        if tick is None:
+            st["same"] += 1
+        else:
+            ticks.append(tick)
         if kind == "umatan":
             synth["u1"] = synth_first(got)
         elif kind == "sanrentan":
             synth["s1"] = synth_first(got)
-    return rows, st, head, synth
+    return rows, st, head, synth, ticks
 
 
 # ---------------------------------------------------------------- 本体
@@ -485,7 +544,7 @@ def main():
     # 表がまだ無い(SQL 未適用)ときは 404 になるが、取り直すだけで害は無い(upsert は何度流しても同じ)。
     # ⚠**書き込みの失敗は rc 1 のまま**= 表が無ければ投入で必ず落ちる(黙って成功しない)
     try:
-        have = sb_get(url, key, f"{TABLE}?select=track,race_no,kind,is_final&race_date=eq.{date.isoformat()}")
+        have = sb_get(url, key, f"{TABLE}?select=track,race_no,kind,is_final,h&race_date=eq.{date.isoformat()}")
     except Exception as e:
         log(f"⚠{TABLE} の下読みに失敗(取り直しになるだけ): {type(e).__name__}: {str(e)[:120]}")
         have = []
@@ -498,6 +557,9 @@ def main():
     all_kinds = {k for _, kinds in PAGES for k in kinds}
     done = [{"track": t, "race_no": n, "is_final": True}
             for (t, n), ks in got_final.items() if all_kinds <= ks]
+    # §132 前の周回の指紋。⛔h が空の古い行は「無い」扱い= その券種が 1 回だけ余分に積まれるだけ
+    prev_h = {(r.get("track"), int(r.get("race_no")), r.get("kind")): r.get("h")
+              for r in have if r.get("h") and r.get("race_no") is not None}
 
     targets = pick_targets(races, done, now_min, args.before, args.after, args.limit)
     log(f"{date} 当日のレース {len(races)} / 対象 {len(targets)}"
@@ -505,16 +567,18 @@ def main():
     if not targets:
         return 0
 
-    rows, tot = [], {"ok": 0, "ng": 0, "empty": 0, "absent": 0, "reject": 0, "final": 0}
+    rows, ticks = [], []
+    tot = {"ok": 0, "ng": 0, "empty": 0, "absent": 0, "reject": 0, "final": 0, "same": 0}
     for i, t in enumerate(targets):
         if i:
             time.sleep(SLEEP)
         log(f"  {t['track']} {t['race_no']}R(発走まで {t['delta']} 分)")
         save = (Path(args.save_fixtures) / f"{t['track']}_{t['race_no']}R") if args.save_fixtures else None
-        got, st, head, synth = fetch_race(date, t, save_dir=save)
+        got, st, head, synth, tk = fetch_race(date, t, save_dir=save, prev_h=prev_h)
         if save:
             log(f"    生HTMLを保存: {save}({head} 頭)")
         rows.extend(got)
+        ticks.extend(tk)
         if synth:
             t["synth"] = synth
             u1, s1 = synth.get("u1") or {}, synth.get("s1") or {}
@@ -525,6 +589,7 @@ def main():
 
     log(f"取得 成功 {tot['ok']} / 失敗 {tot['ng']} / 発売前 {tot['empty']} / その場に無い {tot['absent']} / "
         f"検算落ち {tot['reject']} / 最終 {tot['final']}(行 {len(rows)})")
+    log(f"全点 +{len(ticks)} 行(同じ中身で飛ばした {tot['same']} 券種)")
     if args.dry_run:
         log("dry-run: 投入しない")
         return 0
@@ -535,6 +600,14 @@ def main():
         log(f"投入失敗 status={status} {msg}")
         return 1
     log(f"投入 {len(rows)} 行 -> {TABLE}")
+    # §132 中身が変わった周回だけ全点を積む(nar_odds_full は最新1行のまま)。⛔上の upsert が通った後だけ
+    if ticks:
+        status, msg = insert(url, key, FULL_TICKS, ticks)
+        if status == 409:
+            log(f"⚠{FULL_TICKS} に同じ時刻の行が既にある(二重には入らない): {msg[:120]}")
+        elif status >= 300 or status == 0:
+            log(f"全点の投入失敗 status={status} {msg}")
+            return 1
     # §123 同じ周回の 2 分刻みの行(odds_tanfuku.py が先に入れている)に 1着固定の合成を書き足す
     for t in targets:
         if t.get("synth"):
