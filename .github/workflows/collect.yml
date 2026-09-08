@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       until:
-        description: 'JST HHMM until (empty: 1600 before 16:00, else 2200)'
+        description: 'JST HHMM until (empty: 1600 before 15:30, else 2200)'
         required: false
         default: ''
 concurrency:
@@ -38,6 +38,6 @@ jobs:
           UNTIL_IN: ${{ github.event.inputs.until }}
         run: |
           H=$(TZ=Asia/Tokyo date +%H%M)
-          if [ -n "$UNTIL_IN" ]; then U="$UNTIL_IN"; elif [ $((10#$H)) -lt 1600 ]; then U=1600; else U=2200; fi
+          if [ -n "$UNTIL_IN" ]; then U="$UNTIL_IN"; elif [ $((10#$H)) -lt 1530 ]; then U=1600; else U=2200; fi
           echo "JST $H -> $U"
           python loop.py --until "$U"
