@@ -5,7 +5,7 @@
 確かめるのは 3 つ=
   ①同じ中身なら同じ h・1 組でもオッズや人気が変われば違う h(人気順の券種と枠連の両方)
   ②h は投入する JSON と同じ直列化の md5(16進 32 桁)
-  ③前の周回と同じ h は積まない・違えば積む・最終は同じ h でも 1 回積む
+  ③前の周回と同じ h は積まない・違えば積む・最終は同じ h でも 1 回だけ積む(もう積んだ最終は積まない)
 """
 import datetime as dt
 import hashlib
@@ -79,6 +79,18 @@ class RowsForKindTest(unittest.TestCase):
         self.assertIsNotNone(tick)
         self.assertIs(tick["f"], True)
         self.assertIs(row["is_final"], True)
+
+    def test_final_already_stacked_is_not_stacked_again(self):
+        # 1 券種でも取れない周があるとそのレースは発走 +8 分まで毎周取りに来る(pick_targets が外すのは
+        # 7 券種そろって最終のレースだけ)。前の周で最終として積んだ券種は、同じ中身なら積まない。
+        prev_h, prev_final = {KEY: combos_h("umaren", GOT)}, {KEY}
+        row, tick = rows_for_kind(TARGET, DATE, "umaren", GOT, True, NOW, prev_h, prev_final)
+        self.assertIsNone(tick)
+        self.assertIs(row["is_final"], True)          # 最新の行(上書き)は毎周書く
+        # ⛔積んだ後でも中身が動けば積む(最終の訂正を落とさない)
+        moved = [(GOT[0][0], 6.3, GOT[0][2])] + GOT[1:]
+        _row, tick2 = rows_for_kind(TARGET, DATE, "umaren", moved, True, NOW, prev_h, prev_final)
+        self.assertIsNotNone(tick2)
 
     def test_another_race_fingerprint_is_not_reused(self):
         _row, tick = self.build({("高知", 6, "umaren"): combos_h("umaren", GOT)})

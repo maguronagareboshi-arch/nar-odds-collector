@@ -331,19 +331,22 @@ def combos_h(kind, rows):
     return hashlib.md5(body.encode("utf-8")).hexdigest()
 
 
-def rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h):
-    """1 券種ぶんの (最新の行, 全点の行)。中身が前の周回と同じで最終でもなければ全点は None。
+def rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h, prev_final=None):
+    """1 券種ぶんの (最新の行, 全点の行)。積むのは「指紋が変わった」か「まだ積んでいない最終」だけ。
 
-    ⛔最終(is_final)は指紋が同じでも 1 回だけ積む(最終が揃ったレースは以後 pick_targets から外れる)。
+    ⛔最終(is_final)を積むのは **その券種をまだ最終として積んでいないとき 1 回だけ**。
+      pick_targets が外すのは **7 券種すべて**が最終になったレースなので、1 券種でも取れない周があると
+      残りの最終は発走 +8 分まで毎周取りに来る= 前の周の is_final を見ないと同じ最終が何度も積まれる。
     """
     combos = combos_json(kind, got)
     h = combos_h(kind, got)
+    k = (target["track"], target["race_no"], kind)
     key = {"track": target["track"], "race_date": date.isoformat(),
            "race_no": target["race_no"], "kind": kind, "observed_at": now_utc}
-    row = dict(key, is_final=is_final, combos=combos, h=h, updated_at=now_utc)
-    if h == prev_h.get((target["track"], target["race_no"], kind)) and not is_final:
-        return row, None
-    return row, dict(key, f=is_final, h=h, combos=combos)
+    row = dict(key, is_final=is_final, combos=combos, h=h, updated_at=now_utc)   # 最新の行は毎周書く
+    if h != prev_h.get(k) or (is_final and k not in (prev_final or ())):
+        return row, dict(key, f=is_final, h=h, combos=combos)
+    return row, None
 
 
 # ---------------------------------------------------------------- 1着固定の合成オッズ(§123)
@@ -422,13 +425,14 @@ def save_page(save_dir, path, page):
     p.write_text(page, encoding="utf-8")
 
 
-def fetch_race(date, target, save_dir=None, prev_h=None):
+def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
     """1レースの6ページを取り、券種ごとの行にする。→ (rows, stats, 頭数, 合成, 全点)。
 
     rows= nar_odds_full の upsert 用(最新1行)・ticks= nar_odds_full_ticks の insert 用(中身が変わった券種だけ)。
     """
     now_utc = dt.datetime.now(dt.timezone.utc).isoformat()   # このレースの 7 券種はこの 1 つを共有する
     prev_h = prev_h or {}
+    prev_final = prev_final or set()
     rows, ticks = [], []
     st = {"ok": 0, "ng": 0, "empty": 0, "absent": 0, "reject": 0, "final": 0, "same": 0}
     head = None
@@ -471,7 +475,7 @@ def fetch_race(date, target, save_dir=None, prev_h=None):
                 st["ok"] += 1
                 st["final"] += 1 if is_final else 0
                 log(f"    {KIND_LABEL[kind]} {len(got)}組{' (最終)' if is_final else ''} 先頭3組 {got[:3]}")
-                row, tick = rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h)
+                row, tick = rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h, prev_final)
                 rows.append(row)
                 if tick is None:
                     st["same"] += 1
@@ -495,7 +499,7 @@ def fetch_race(date, target, save_dir=None, prev_h=None):
         scratched = "" if m == head else f"・取消 {head - m} 頭とみなす"
         log(f"    {KIND_LABEL[kind]} {len(got)}組 = {m}頭の全通り{scratched}"
             f"{' (最終)' if is_final else ''} 先頭3組 {[(list(a), o, r) for a, o, r in got[:3]]}")
-        row, tick = rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h)
+        row, tick = rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h, prev_final)
         rows.append(row)
         if tick is None:
             st["same"] += 1
@@ -560,6 +564,10 @@ def main():
     # §132 前の周回の指紋。⛔h が空の古い行は「無い」扱い= その券種が 1 回だけ余分に積まれるだけ
     prev_h = {(r.get("track"), int(r.get("race_no")), r.get("kind")): r.get("h")
               for r in have if r.get("h") and r.get("race_no") is not None}
+    # ⛔もう最終として積んだ券種。pick_targets は 7 券種そろって最終のレースしか外さないので、
+    #   1 券種でも取れない周があると残りの最終が毎周積まれる= ここで止める
+    prev_final = {(r.get("track"), int(r.get("race_no")), r.get("kind"))
+                  for r in have if r.get("is_final") and r.get("race_no") is not None}
 
     targets = pick_targets(races, done, now_min, args.before, args.after, args.limit)
     log(f"{date} 当日のレース {len(races)} / 対象 {len(targets)}"
@@ -574,7 +582,8 @@ def main():
             time.sleep(SLEEP)
         log(f"  {t['track']} {t['race_no']}R(発走まで {t['delta']} 分)")
         save = (Path(args.save_fixtures) / f"{t['track']}_{t['race_no']}R") if args.save_fixtures else None
-        got, st, head, synth, tk = fetch_race(date, t, save_dir=save, prev_h=prev_h)
+        got, st, head, synth, tk = fetch_race(date, t, save_dir=save, prev_h=prev_h,
+                                              prev_final=prev_final)
         if save:
             log(f"    生HTMLを保存: {save}({head} 頭)")
         rows.extend(got)
