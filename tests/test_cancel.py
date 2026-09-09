@@ -2,11 +2,12 @@
 """§137 取り止めの印(公式 payback)と告知文(当日メニュー)の検算。標準ライブラリだけ・通信なし。
 
 実行: python -m unittest discover -s tests -p "test_*.py"
-確かめるのは 4 つ=
+確かめるのは 5 つ=
   ①組番が1つも無く払戻金に 100 がある = refund(発売後に取り止め・全額返還)
   ②組番も払戻金も全部空 = nosale(発売前に取り止め)
   ③走ったレース(着順あり/組番あり)は印なし・payback 行の無いレースは鍵ごと返さない
   ④告知文= 「第7競走以降」→7・開催そのものの中止→1・発走時刻の変更→書かない・告知なし→書かない
+  ⑤当日の便が書く行= 取り止めのレースは **races だけ**足す(着順が無いので今までは 1 行も書かれなかった)
 """
 import sys
 import unittest
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nar_official_csv import race_cancel_marks                       # noqa: E402
 from post_time_refresh import cancel_from, parse_list, warning_text  # noqa: E402
+from results_today import rows_to_write                              # noqa: E402
 
 TRACK = "笠松"
 YMD = "20260908"
@@ -111,6 +113,37 @@ class TestWarningText(unittest.TestCase):
         self.assertEqual(len(got), 10)
         self.assertEqual(got[1], "1155")
         self.assertEqual(got[10], "1655")
+
+
+class TestRowsToWrite(unittest.TestCase):
+    """⑤ 当日の便(2 分おき)が書く行。2026-09-08 の笠松と同じ形= 1〜6R が確定・7〜10R が取り止め"""
+
+    @staticmethod
+    def dedup():
+        return {
+            "races": {(TRACK, DATE, no): {"race_no": no} for no in range(1, 11)},
+            "runs": {(TRACK, DATE, no, i): {} for no in range(1, 11) for i in (1, 2)},
+            "payouts": {(TRACK, DATE, no): {} for no in range(1, 7)},
+            "horses": {("ウマ",): {}},
+        }
+
+    def test_cancelled_races_are_written_the_same_day(self):
+        out = rows_to_write(self.dedup(), [(TRACK, n) for n in range(1, 7)],
+                            [(TRACK, n) for n in range(7, 11)])
+        self.assertEqual(sorted(k[2] for k in out["races"]), list(range(1, 11)))   # 7〜10R も入る
+        self.assertEqual(sorted({k[2] for k in out["runs"]}), list(range(1, 7)))   # ⛔runs は結果のある回だけ
+        self.assertEqual(sorted(k[2] for k in out["payouts"]), list(range(1, 7)))
+        self.assertEqual(out["horses"], {})                                        # ⛔馬テーブルは書かない
+
+    def test_without_cancelled_nothing_changes(self):
+        out = rows_to_write(self.dedup(), [(TRACK, n) for n in range(1, 7)], [])
+        self.assertEqual(sorted(k[2] for k in out["races"]), list(range(1, 7)))
+
+    def test_whole_day_cancelled(self):
+        """丸一日の取り止め(着順が 1 つも無い日)でも races は書く"""
+        out = rows_to_write(self.dedup(), [], [(TRACK, n) for n in range(1, 11)])
+        self.assertEqual(sorted(k[2] for k in out["races"]), list(range(1, 11)))
+        self.assertEqual(out["runs"], {})
 
 
 if __name__ == "__main__":
