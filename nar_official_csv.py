@@ -330,6 +330,65 @@ def normalize_payouts(rows: Iterable[dict[str, str]], *, source_url: str,
     return output
 
 
+# §137 公式 payback.csv の「組番」と「払戻金」の列(normalize_payouts が使うのと同じ字)。
+# 取り止めになった回は **組番が空のまま払戻金だけ 100**(全額返還)で来る。_add_payout は組番の無い行を
+# 捨てるので、捨てる前にレース単位で見ないと「払戻なし」と見分けが付かない(2026-09-08 実測)。
+_PAYBACK_COMBO_COLS = (
+    "単勝組番", "複勝組番1", "複勝組番2", "複勝組番3",
+    "馬複組番1", "馬複組番2", "馬単組番1", "馬単組番2",
+    "ワイド組番1馬番1", "ワイド組番1馬番2", "ワイド組番2馬番1", "ワイド組番2馬番2",
+    "ワイド組番3馬番1", "ワイド組番3馬番2",
+    "３連複組番馬番1", "３連複組番馬番2", "３連複組番馬番3",
+    "３連単組番馬番1", "３連単組番馬番2", "３連単組番馬番3",
+)
+_PAYBACK_YEN_COLS = (
+    "単勝払戻金（円）", "複勝払戻金1（円）", "複勝払戻金2（円）", "複勝払戻金3（円）",
+    "馬複払戻金（円）", "馬単払戻金（円）",
+    "ワイド払戻金1（円）", "ワイド払戻金2（円）", "ワイド払戻金3（円）",
+    "３連複払戻金（円）", "３連単払戻金（円）",
+)
+REFUND_YEN = 100        # 発売後に取り止め= 買った分は全額返る= 払戻金の欄が 100 で埋まる
+
+
+def race_cancel_marks(payback_rows: Iterable[dict[str, str]],
+                      horses: Iterable[dict[str, Any]]) -> dict[tuple[str, str, int], str | None]:
+    """公式 payback.csv をレース単位で見て、取り止めの印を作る(§137)。
+
+    戻り = {(競馬場, 競走年月日, レース番号): "refund" | "nosale" | None}。
+      refund … 組番が1つも無く、払戻金に 100 がある = 発売後に取り止め(全額返還)
+      nosale … 組番も払戻金も全部空                = 発売前に取り止め
+      None   … 取り止めではない(印が入っていたら消す)
+
+    ⛔payback 行の**無い**レースは鍵ごと返さない= 出馬表だけの先の日には触らない
+      (実測 2026-09-07 13:27 の月次: racelist 420 行に対し payback は 292 行= まだ走っていない
+       128 レースには payback 行が無い。開催前の朝の日次に至っては payback 0 行)。
+    ⛔着順が1頭でもあるレースには印を付けない(走ったのだから取り止めではない)。
+    ⛔組番が1つでもあれば売れて確定している= 印なし(一部の券種だけ返還でも走ったことに変わりはない)。
+    ⛔上のどれでもない形(組番なしで 100 以外の払戻金)は**推定しない**= 印なし。
+    ⛔同じレースに payback 行が2つあって食い違うときも印なし(安全側。実測 2026-09-08 の日次は 59 行 58 レース)。
+    """
+    finished = {(h.get("track"), h.get("race_date"), h.get("race_no"))
+                for h in horses if h.get("finish") is not None}
+    marks: dict[tuple[str, str, int], str | None] = {}
+    for row in payback_rows:
+        try:
+            key = (str(row.get("競馬場") or "").strip(), iso_date(row.get("競走年月日")),
+                   int(_number(row.get("レース番号"), integer=True) or 0))
+        except ValueError:
+            continue
+        mark = None
+        if key not in finished and not any(str(row.get(col) or "").strip() for col in _PAYBACK_COMBO_COLS):
+            payouts = [_number(row.get(col), integer=True) for col in _PAYBACK_YEN_COLS]
+            if any(value == REFUND_YEN for value in payouts):
+                mark = "refund"
+            elif all(value is None for value in payouts):
+                mark = "nosale"
+        if key in marks and (marks[key] is None or mark is None):
+            mark = None                     # 同じレースの行どうしが食い違う= 印を付けない
+        marks[key] = mark
+    return marks
+
+
 def normalize_archive(payload: bytes, *, kind: str, scope: str,
                       source_url: str, observed_at: str) -> dict[str, Any]:
     source_hash = digest_bytes(payload)
@@ -347,9 +406,18 @@ def normalize_archive(payload: bytes, *, kind: str, scope: str,
         race_rows = next((rows for name, rows in files.items() if name.endswith("_racelist.csv")), [])
         horse_rows = next((rows for name, rows in files.items() if name.endswith("_horselist.csv")), [])
         payout_rows = next((rows for name, rows in files.items() if name.endswith("_payback.csv")), [])
+        races = normalize_races(race_rows)
+        horses = normalize_horses(horse_rows)
+        # §137 取り止めの印。payback 行のあるレースにだけ "cancelled" を付ける(無い日は鍵ごと付けない=
+        # 投入側 load_nar_official.py の「無い列は送らない」に乗せて、先の日を null で上書きしない)
+        marks = race_cancel_marks(payout_rows, horses)
+        for race in races:
+            key = (race["track"], race["race_date"], race["race_no"])
+            if key in marks:
+                race["cancelled"] = marks[key]
         document.update({
-            "races": normalize_races(race_rows),
-            "horses": normalize_horses(horse_rows),
+            "races": races,
+            "horses": horses,
             "payouts": normalize_payouts(payout_rows, source_url=source_url, source_hash=source_hash),
         })
     else:

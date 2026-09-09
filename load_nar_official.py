@@ -82,7 +82,7 @@ def to_num(v):
 
 # 正規化JSONの版によって「有る/無い」が変わる列。無い版から来た行は、その列を送らない
 # (null で上書きすると、生ZIPから入れ直した値を消してしまう)。upsert_all が列の組み合わせごとに分けて送る。
-OPTIONAL_RACE_COLS = ("race_kind",)                      # §27.2 普通/特別/重賞/準重賞
+OPTIONAL_RACE_COLS = ("race_kind", "cancelled")          # §27.2 普通/特別/重賞/準重賞・§137 取り止めの印
 OPTIONAL_RUN_COLS = ("birth_date", "trainer_area")       # §38 R-0 生年月日/調教師所属
 
 
