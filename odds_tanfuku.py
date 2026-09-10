@@ -18,7 +18,8 @@ import sys
 import time
 import urllib.parse
 
-from odds_full import BABA, JST, http_get, load_env, log, post_minutes, sb_get, upsert, _num, _text
+from odds_full import (BABA, JST, MIN_BEFORE_OFF, http_get, load_env, log, now_minute, out_of_lane,
+                       post_minutes, sb_get, upsert, _num, _text)
 
 ODDS_URL = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/OddsTanFuku"
 SLEEP = 1.0
@@ -126,7 +127,8 @@ def parse_odds(page):
     return (runners or None), is_final, asof
 
 
-def pick_targets(races, finals, now_min, before, after, limit):
+def pick_targets(races, finals, now_min, before, after, limit, min_before=MIN_BEFORE_OFF):
+    """min_before を与えると、発走までの残りがそれ以下のレースは外す(= 相手の車線が取る)。"""
     done = {(r.get("track"), int(r.get("race_no"))) for r in finals if r.get("is_final")}
     out = []
     for r in races:
@@ -136,7 +138,7 @@ def pick_targets(races, finals, now_min, before, after, limit):
         if baba is None or no is None or pm is None or (track, int(no)) in done:
             continue
         delta = pm - now_min
-        if delta > before or delta < -after:
+        if delta > before or delta < -after or delta <= min_before:
             continue
         out.append({"track": track, "race_no": int(no), "baba": baba, "post": pm, "delta": delta})
     out.sort(key=lambda x: (x["post"], x["track"]))
@@ -152,6 +154,8 @@ def main():
     ap.add_argument("--date")
     ap.add_argument("--before", type=int, default=80)
     ap.add_argument("--after", type=int, default=10)
+    ap.add_argument("--min-before", type=int, default=MIN_BEFORE_OFF,
+                    help="発走までの残りがこれ以下は取らない(既定=分けない。もう一方の車線に任せるとき用)")
     ap.add_argument("--limit", type=int, default=20)
     args = ap.parse_args()
     if args.env:
@@ -173,13 +177,20 @@ def main():
         return 2
     hist_by = {(r.get("track"), int(r.get("race_no"))): (r.get("history") or [])
                for r in finals if r.get("race_no") is not None}
-    targets = pick_targets(races, finals, now_min, args.before, args.after, args.limit)
-    log(f"{date} 当日のレース {len(races)} / 対象 {len(targets)}(発走 {args.before} 分前〜{args.after} 分後・"
+    targets = pick_targets(races, finals, now_min, args.before, args.after, args.limit, args.min_before)
+    note = f"・残り {args.min_before} 分以下は別の車線" if args.min_before > MIN_BEFORE_OFF else ""
+    log(f"{date} 当日のレース {len(races)} / 対象 {len(targets)}(発走 {args.before} 分前〜{args.after} 分後{note}・"
         f"最終済み {sum(1 for r in finals if r.get('is_final'))} は除く)")
     if not targets:
         return 0
     rows, ticks, ok, ng, empty = [], [], 0, 0, 0
+    past_lane = 0                    # 取りに行くころには相手の車線へ移っていたレース
     for i, t in enumerate(targets):
+        cur = now_minute()
+        if out_of_lane(t, args.min_before, cur):
+            past_lane += 1
+            log(f"  車線の外 {t['track']} {t['race_no']}R(発走まで {t['post'] - cur} 分= もう一方が取る)")
+            continue
         if i:
             time.sleep(SLEEP)
         try:
@@ -221,7 +232,8 @@ def main():
         low = min((x["w"] for x in runners if x["w"] is not None), default=None)
         log(f"  {t['track']} {t['race_no']}R {len(runners)}頭 単勝最低 {low}"
             f" 取得 {hhmm} / ページ {asof or '-'}{' (最終)' if is_final else ''}")
-    log(f"取得 成功 {ok} / 失敗 {ng} / 発売前 {empty} / 最終化 {sum(1 for r in rows if r['is_final'])}")
+    log(f"取得 成功 {ok} / 失敗 {ng} / 発売前 {empty} / 車線の外 {past_lane} / "
+        f"最終化 {sum(1 for r in rows if r['is_final'])}")
     if args.dry_run:
         log("dry-run: 投入しない")
         return 0

@@ -26,6 +26,8 @@ from pathlib import Path
 
 JST = dt.timezone(dt.timedelta(hours=9))
 UA = os.environ.get("COLLECTOR_UA") or "odds-collector/1.0"
+# 2 本並べて回すとき、どちらの行かログで分かるようにする目印。空なら今までと同じ書き方。
+TAG = os.environ.get("COLLECTOR_TAG") or ""
 TIMEOUT = 20
 
 # 公式表記の場名 → k_babaCode
@@ -37,7 +39,7 @@ BABA = {
 
 
 def log(msg):
-    print(f"[{dt.datetime.now(JST):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+    print(f"[{dt.datetime.now(JST):%Y-%m-%d %H:%M:%S}]{TAG} {msg}", flush=True)
 
 
 def load_env(path):
@@ -125,8 +127,31 @@ def post_minutes(post_time):
     return int(m.group(1)) * 60 + int(m.group(2)) if m else None
 
 
-def pick_targets(races, finals, now_min, before, after, limit):
-    """発走 before 分前〜 after 分後のレース(最終オッズ済みは除く)。発走が近い順。"""
+def now_minute():
+    """今(JST)が 0 時から何分目か。"""
+    n = dt.datetime.now(JST)
+    return n.hour * 60 + n.minute
+
+
+# 車線を分けないときの --min-before(= before〜after を 1 本で取る。今までと同じ)
+MIN_BEFORE_OFF = -9999
+
+
+def out_of_lane(target, min_before, cur_min):
+    """このレースはもう相手の車線のものか。
+
+    周回が長引くと、取りに行くころには発走までの残りが境目を割っていることがある。そのまま取ると
+    相手の車線と同じ分の行を作ってしまうので、境目以下になったレースは相手に任せる(取りこぼしはしない=
+    相手の車線が次の周で取る)。⛔車線を分けない周回では常に偽= 今までと同じ。
+    """
+    return min_before > MIN_BEFORE_OFF and target["post"] - cur_min <= min_before
+
+
+def pick_targets(races, finals, now_min, before, after, limit, min_before=MIN_BEFORE_OFF):
+    """発走 before 分前〜 after 分後のレース(最終オッズ済みは除く)。発走が近い順。
+
+    min_before を与えると、発走までの残りがそれ以下のレースは外す(= 相手の車線が取る)。
+    """
     done = {(r.get("track"), int(r.get("race_no"))) for r in finals if r.get("is_final")}
     out = []
     for r in races:
@@ -138,7 +163,7 @@ def pick_targets(races, finals, now_min, before, after, limit):
         if (track, int(no)) in done:
             continue
         delta = pm - now_min
-        if delta > before or delta < -after:
+        if delta > before or delta < -after or delta <= min_before:
             continue
         out.append({"track": track, "race_no": int(no), "baba": baba, "post": pm, "delta": delta})
     out.sort(key=lambda x: (x["post"], x["track"]))
@@ -545,6 +570,8 @@ def main():
     ap.add_argument("--date", help="対象日 YYYY-MM-DD(既定=今日。公式は当日分しか返さない)")
     ap.add_argument("--before", type=int, default=60, help="発走の何分前から取るか(既定60)")
     ap.add_argument("--after", type=int, default=10, help="発走の何分後まで取るか(既定10)")
+    ap.add_argument("--min-before", type=int, default=MIN_BEFORE_OFF,
+                    help="発走までの残りがこれ以下は取らない(既定=分けない。もう一方の車線に任せるとき用)")
     ap.add_argument("--limit", type=int, default=10, help="1回の実行で取るレース数の上限(既定10)")
     ap.add_argument("--save-fixtures", metavar="DIR",
                     help="取得した生HTMLを DIR/<場>_<R>R/ に保存する(処理したレースぶん全部)")
@@ -591,15 +618,22 @@ def main():
     prev_final = {(r.get("track"), int(r.get("race_no")), r.get("kind"))
                   for r in have if r.get("is_final") and r.get("race_no") is not None}
 
-    targets = pick_targets(races, done, now_min, args.before, args.after, args.limit)
+    targets = pick_targets(races, done, now_min, args.before, args.after, args.limit, args.min_before)
+    note = f"・残り {args.min_before} 分以下は別の車線" if args.min_before > MIN_BEFORE_OFF else ""
     log(f"{date} 当日のレース {len(races)} / 対象 {len(targets)}"
-        f"(発走 {args.before} 分前〜{args.after} 分後・全券種の最終が揃った {len(done)} レースは除く)")
+        f"(発走 {args.before} 分前〜{args.after} 分後{note}・全券種の最終が揃った {len(done)} レースは除く)")
     if not targets:
         return 0
 
     rows, ticks = [], []
     tot = {"ok": 0, "ng": 0, "empty": 0, "absent": 0, "reject": 0, "final": 0, "same": 0}
+    past_lane = 0                    # 取りに行くころには相手の車線へ移っていたレース
     for i, t in enumerate(targets):
+        cur = now_minute()
+        if out_of_lane(t, args.min_before, cur):
+            past_lane += 1
+            log(f"  車線の外 {t['track']} {t['race_no']}R(発走まで {t['post'] - cur} 分= もう一方が取る)")
+            continue
         if i:
             time.sleep(SLEEP)
         log(f"  {t['track']} {t['race_no']}R(発走まで {t['delta']} 分)")
@@ -619,7 +653,7 @@ def main():
             tot[k] += st[k]
 
     log(f"取得 成功 {tot['ok']} / 失敗 {tot['ng']} / 発売前 {tot['empty']} / その場に無い {tot['absent']} / "
-        f"検算落ち {tot['reject']} / 最終 {tot['final']}(行 {len(rows)})")
+        f"検算落ち {tot['reject']} / 最終 {tot['final']} / 車線の外 {past_lane}(行 {len(rows)})")
     log(f"全点 +{len(ticks)} 行(同じ中身で飛ばした {tot['same']} 券種)")
     if args.dry_run:
         log("dry-run: 投入しない")
