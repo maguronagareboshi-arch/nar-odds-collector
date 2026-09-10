@@ -43,22 +43,44 @@ def _minutes_between(a, b):
     return d if d >= 0 else d + 24 * 60
 
 
-def insert(url, key, table, rows):
-    """PostgREST の insert(重複解決なし)。"""
+TICK_KEY = "track,race_date,race_no,t"   # 同じレースの同じ分は 1 行(表の一意索引 nar_odds_ticks_minute_key と同じ列)
+
+
+def insert_request(url, key, table, rows, conflict=None):
+    """PostgREST の insert の Request。conflict(列名の並び)を与えると、同じ鍵の行が既にあれば 2 本目を捨てる
+    (ON CONFLICT DO NOTHING)。便の引き継ぎで前の便の最後の周と次の便の最初の周が同じ分に入ることがあり、
+    そのとき 2 本目を作らないため(実測 2026-09-04〜09-10 に 22 組)。"""
     import json as _json
-    import urllib.error as _err
     import urllib.request as _req
     body = _json.dumps(rows, ensure_ascii=False).encode("utf-8")
-    req = _req.Request(f"{url}/rest/v1/{table}", data=body, method="POST",
-                       headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                                "Prefer": "return=minimal"})
-    try:
-        with _req.urlopen(req, timeout=60) as r:
-            return r.status, ""
-    except _err.HTTPError as e:
-        return e.code, e.read().decode()[:300]
-    except Exception as e:
-        return 0, str(e)
+    path = f"{url}/rest/v1/{table}"
+    prefer = "return=minimal"
+    if conflict:
+        path += f"?on_conflict={conflict}"
+        prefer += ",resolution=ignore-duplicates"
+    return _req.Request(path, data=body, method="POST",
+                        headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                                 "Prefer": prefer})
+
+
+def insert(url, key, table, rows, conflict=None):
+    """PostgREST の insert。conflict を与えたのに表に一意索引が無ければ 400 が返るので、その時は今までどおりの
+    重複解決なしの insert に落とす(行を失わない)。"""
+    import urllib.error as _err
+    import urllib.request as _req
+    for c in ((conflict, None) if conflict else (None,)):
+        try:
+            with _req.urlopen(insert_request(url, key, table, rows, c), timeout=60) as r:
+                return r.status, ""
+        except _err.HTTPError as e:
+            msg = e.read().decode()[:300]
+            if c and e.code == 400:
+                log(f"  {table}: 一意索引が無いので重複解決なしで入れ直す({msg[:80]})")
+                continue
+            return e.code, msg
+        except Exception as e:
+            return 0, str(e)
+    return 0, "unreachable"
 
 
 def odds_url(date, race_no, baba):
@@ -246,7 +268,7 @@ def main():
     log(f"投入 {len(rows)} 行 -> {TABLE}")
     # 2 分刻みは別の表へ(insert)。表がまだ無い等で落ちても単複本体は入っているので rc は 0 のまま(ログに残す)
     if ticks:
-        st2, msg2 = insert(url, key, TICKS, ticks)
+        st2, msg2 = insert(url, key, TICKS, ticks, conflict=TICK_KEY)
         if st2 >= 300 or st2 == 0:
             log(f"⚠{TICKS} の追記に失敗 status={st2} {msg2}")
         else:
