@@ -1,4 +1,4 @@
-# 当日オッズ(単複+全券種)を 2 分おきに取る。1 ジョブが最長 6 時間なので、昼の便(〜16:00)と夜の便(〜22:00)に分けて JST 10:00〜22:00 を覆う。
+# 当日オッズ(単複+全券種)を取る。発走 40〜10 分前は 2 分おき(far)・発走 10 分前〜8 分後は 1 分おき(hot)の 2 本を同じジョブで並走。1 ジョブが最長 6 時間なので、昼の便(〜16:00)と夜の便(〜22:00)に分けて JST 10:00〜22:00 を覆う。
 # 公開リポジトリなので Actions の分数は無制限。手動実行は until(JST HHMM)を指定できる。
 # Secrets: SUPABASE_URL / SUPABASE_SERVICE_KEY(任意: COLLECTOR_UA)
 name: collect
@@ -30,7 +30,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: loop (every 2 min)
+      - name: loop (far: every 2 min / hot: every 1 min)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -40,4 +40,6 @@ jobs:
           H=$(TZ=Asia/Tokyo date +%H%M)
           if [ -n "$UNTIL_IN" ]; then U="$UNTIL_IN"; elif [ $((10#$H)) -lt 1530 ]; then U=1600; else U=2200; fi
           echo "JST $H -> $U"
-          python loop.py --until "$U"
+          python loop.py --until "$U" --lane far &
+          python loop.py --until "$U" --lane hot
+          wait
