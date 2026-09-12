@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""統合ビューア ステップ2: NAR公式データ(全15場)を Supabase の nar_* テーブルへ投入する。
+"""本体 ステップ2: NAR公式データ(全15場)を Supabase の nar_* テーブルへ投入する。
 
 入力: 他場\\data\\nar_official_csv\\normalized\\*.json(nar_official_csv.py が作った正規化JSON。月次+日次)
 出力: nar_races / nar_runs / nar_payouts(supabase-nar-official.sql で作成済みであること)

@@ -1,4 +1,4 @@
-# 統合ビューア cloud: 元は 他場/scraper/nar_official_csv.py の写し(2026-08-23)だが、統合ビューアの正規化はこちらが正本。
+# 本体 cloud: 元は 他場/scraper/nar_official_csv.py の写し(2026-08-23)だが、本体の正規化はこちらが正本。
 # ⚠ 当日更新の本線 = GitHub Actions → cloud/refresh.py → **この写し**(PROJECT.md)。
 #   PC 側の予備 pipeline/nar_refresh.py だけが 他場/scraper の古い写しを読む(sys.path)。
 #   他場 は読み取り専用(PROJECT.md)なので向こうは直さない = 2つは既にずれている:
