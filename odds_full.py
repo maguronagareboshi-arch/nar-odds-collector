@@ -468,7 +468,7 @@ def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
 
     rows= nar_odds_full の upsert 用(最新1行)・ticks= nar_odds_full_ticks の insert 用(中身が変わった券種だけ)。
     """
-    now_utc = dt.datetime.now(dt.timezone.utc).isoformat()   # このレースの 7 券種はこの 1 つを共有する
+    # observed_at is stamped after each page has been downloaded and parsed.
     prev_h = prev_h or {}
     prev_final = prev_final or set()
     rows, ticks = [], []
@@ -517,7 +517,7 @@ def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
                 st["ok"] += 1
                 st["final"] += 1 if is_final else 0
                 log(f"    {KIND_LABEL[kind]} {len(got)}組{' (最終)' if is_final else ''} 先頭3組 {got[:3]}")
-                row, tick = rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h, prev_final)
+                row, tick = rows_for_kind(target, date, kind, got, is_final, dt.datetime.now(dt.timezone.utc).isoformat(), prev_h, prev_final)
                 rows.append(row)
                 if tick is None:
                     st["same"] += 1
@@ -546,7 +546,7 @@ def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
         scratched = "" if m == head else f"・取消 {head - m} 頭とみなす"
         log(f"    {KIND_LABEL[kind]} {len(got)}組 = {m}頭の全通り{scratched}"
             f"{' (最終)' if is_final else ''} 先頭3組 {[(list(a), o, r) for a, o, r in got[:3]]}")
-        row, tick = rows_for_kind(target, date, kind, got, is_final, now_utc, prev_h, prev_final)
+        row, tick = rows_for_kind(target, date, kind, got, is_final, dt.datetime.now(dt.timezone.utc).isoformat(), prev_h, prev_final)
         rows.append(row)
         if tick is None:
             st["same"] += 1

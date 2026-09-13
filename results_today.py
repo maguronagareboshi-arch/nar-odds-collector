@@ -91,6 +91,7 @@ def main():
     t0 = time.time()
     try:
         payload, final = download_archive(download_url("race", scope="daily", race_date=today))
+        received_at = dt.datetime.now(dt.timezone.utc).isoformat()
         doc = normalize_archive(payload, kind="race", scope="daily", source_url=final,
                                 observed_at=dt.datetime.now(dt.timezone.utc).isoformat())
     except ValueError as e:                       # ZIP でない応答= 開催なし or エラーページ
@@ -101,6 +102,15 @@ def main():
     races = doc.get("races") or []
     if today not in {r.get("race_date") for r in races}:
         log("当日のレースが無い"); return 0
+    # Save the response already in memory. Failure must not stop result updates.
+    if not a.dry_run:
+        try:
+            from research_archive import archive_if_needed
+            archived = archive_if_needed(payload, received_at, races)
+            if archived['status'] not in ('DISABLED', 'OUTSIDE_PREOFF_WINDOW'):
+                log('research archive: ' + archived['status'])
+        except Exception as exc:
+            log('research archive failed: ' + type(exc).__name__)
     horses = doc.get("horses") or []
     fin = sorted({(h["track"], int(h["race_no"])) for h in horses if str(h.get("finish") or "").strip()})
     pays = len(doc.get("payouts") or [])

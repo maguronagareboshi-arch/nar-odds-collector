@@ -35,6 +35,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
+          NAR_RESEARCH_ARCHIVE_DIR: research-preoff
           UNTIL_IN: ${{ github.event.inputs.until }}
         run: |
           H=$(TZ=Asia/Tokyo date +%H%M)
@@ -43,3 +44,11 @@ jobs:
           python loop.py --until "$U" --lane far &
           python loop.py --until "$U" --lane hot
           wait
+      - name: retain preoff research inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nar-preoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: research-preoff/
+          retention-days: 14
+          if-no-files-found: ignore
