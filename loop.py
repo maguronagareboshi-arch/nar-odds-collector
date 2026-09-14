@@ -32,6 +32,18 @@ LANES = {
     "hot": (60, 10, 8, None, False),
 }
 LIMIT = 40          # 1 回の実行で取るレース数の上限(窓に入るのは多くて 6 前後)
+MAX_RUN_SECONDS = 345 * 60  # Leave 15 minutes before GitHub's six-hour hard stop.
+
+
+def bounded_child(command, env, deadline):
+    """Stop this lane cleanly at its budget, including a slow child request."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        return subprocess.call([sys.executable] + command, env=env, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        return None
 
 
 def lane_plan(lane, every=None, before=None, after=None, min_before=None):
@@ -74,7 +86,11 @@ def main():
     ap.add_argument("--after", type=int, help="発走の何分後まで(既定は車線ごと)")
     ap.add_argument("--min-before", type=int, help="発走までの残りがこれ以下は相手の車線に任せる")
     ap.add_argument("--start", type=int, default=9 * 60 + 30, help="この時刻(JST 分)より前に起動したら何もしない")
+    ap.add_argument("--max-run-seconds", type=int, default=MAX_RUN_SECONDS,
+                    help="収集を正常終了する実行秒数(最大20700秒)。次の既存ジョブへ引き継ぐ")
     a = ap.parse_args()
+    if not 0 < a.max_run_seconds <= MAX_RUN_SECONDS:
+        ap.error("--max-run-seconds must be between 1 and 20700")
     plan = lane_plan(a.lane, a.every, a.before, a.after, a.min_before)
     until = int(a.until[:2]) * 60 + int(a.until[2:])
     # 深夜〜早朝に(遅れて)起動した回は何もせず終わる= 6 時間の枠を空回りで使い切り、朝の回を待たせないため
@@ -91,8 +107,12 @@ def main():
     print(f"[{now:%H:%M:%S}] 車線 {a.lane}= {plan['every']} 秒ごと・発走 {plan['before']} 分前〜"
           f"{plan['after']} 分後{note}・おまけ {'あり' if plan['extras'] else 'なし'}", flush=True)
     n = 0
+    deadline = time.monotonic() + a.max_run_seconds
     while True:
         now = dt.datetime.now(JST)
+        if time.monotonic() >= deadline:
+            print(f"[{now:%H:%M:%S}] 収集の実行上限前に正常終了。保存後、次の既存ジョブへ引継ぎ", flush=True)
+            return 0
         if now.hour * 60 + now.minute >= until:
             print(f"[{now:%H:%M:%S}] {a.until} を過ぎたので終了(車線 {a.lane}・周回 {n})", flush=True)
             return 0
@@ -100,15 +120,21 @@ def main():
         n += 1
         print(f"===== {a.lane} 周回 {n} {now:%H:%M:%S} =====", flush=True)
         for script in ("odds_tanfuku.py", "odds_full.py"):
-            rc = subprocess.call([sys.executable] + odds_cmd(script, plan), env=env)
+            rc = bounded_child(odds_cmd(script, plan), env, deadline)
+            if rc is None:
+                print("収集の実行枠が終了。成果物保存のため正常終了", flush=True)
+                return 0
             if rc:
                 print(f"  {script} rc={rc}(次の周で取り直す)", flush=True)
         # 間引いて回すもの(落ちても次の周に任せる= オッズ本体は止めない)
         for cmd in extra_cmds(plan, n):
-            rc = subprocess.call([sys.executable] + cmd, env=env)
+            rc = bounded_child(cmd, env, deadline)
+            if rc is None:
+                print("収集の実行枠が終了。成果物保存のため正常終了", flush=True)
+                return 0
             if rc:
                 print(f"  {cmd[0]} rc={rc}(次の周で取り直す)", flush=True)
-        wait = plan["every"] - (time.time() - t0)
+        wait = min(plan["every"] - (time.time() - t0), deadline - time.monotonic())
         if wait > 0:
             time.sleep(wait)
 
