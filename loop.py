@@ -11,6 +11,8 @@
   all(既定) … 発走 40 分前〜8 分後を 120 秒ごと。1 本で回していたときと同じ。
   far       … 発走 40 分前〜10 分前を 120 秒ごと。下のおまけもこちらで回す。
   hot       … 発走 10 分前〜8 分後を 60 秒ごと。おまけは回さない(オッズだけを 1 分刻みにする)。
+  morning   … 発走 600 分前〜40 分前を 1800 秒ごと(§234・2026-09-20)。朝 10 時ごろの公開から 30 分おきに
+              単勝・複勝だけを写す。残り 40 分以下は far に任せる。全券種(odds_full.py)もおまけも回さない。
 
 2 分ごとに要らないものは、周回を間引いて回す(オッズの刻みを遅らせないため):
   post_time_refresh.py … 5 周に 1 回(約 10 分)。発走時刻は当日ずれることがある。
@@ -30,8 +32,14 @@ LANES = {
     "all": (120, 40, 8, None, True),
     "far": (120, 40, 8, 10, True),
     "hot": (60, 10, 8, None, False),
+    "morning": (1800, 600, 0, 40, False),
 }
 LIMIT = 40          # 1 回の実行で取るレース数の上限(窓に入るのは多くて 6 前後)
+# 朝の車線だけは窓が広く、当日の未発走レースがほぼ全部入る(3〜4 場 × 12 レース)。40 では足りないので増やす。
+LANE_LIMIT = {"morning": 60}
+# 全券種(3 連単まで)を回さない車線。⛔朝は単複だけ= 重い表の行数と HTTP を増やさない(§234)。
+TANFUKU_ONLY = {"morning"}
+ODDS_SCRIPTS = ("odds_tanfuku.py", "odds_full.py")
 
 
 def lane_plan(lane, every=None, before=None, after=None, min_before=None):
@@ -41,11 +49,15 @@ def lane_plan(lane, every=None, before=None, after=None, min_before=None):
             "before": b if before is None else before,
             "after": a if after is None else after,
             "min_before": mb if min_before is None else min_before,
-            "extras": extras}
+            "extras": extras,
+            "limit": LANE_LIMIT.get(lane, LIMIT),
+            "scripts": ("odds_tanfuku.py",) if lane in TANFUKU_ONLY else ODDS_SCRIPTS}
 
 
-def odds_cmd(script, plan, limit=LIMIT):
+def odds_cmd(script, plan, limit=None):
     """オッズ 1 本ぶんの引数。⛔車線を分けない周回では --min-before を付けない= 今までと同じ行。"""
+    if limit is None:
+        limit = plan.get("limit", LIMIT)
     cmd = [script, "--before", str(plan["before"]), "--after", str(plan["after"]), "--limit", str(limit)]
     if plan["min_before"] is not None:
         cmd += ["--min-before", str(plan["min_before"])]
@@ -89,7 +101,8 @@ def main():
         env["COLLECTOR_TAG"] = f"[{a.lane}]"
     note = f"・残り {plan['min_before']} 分以下は別の車線" if plan["min_before"] is not None else ""
     print(f"[{now:%H:%M:%S}] 車線 {a.lane}= {plan['every']} 秒ごと・発走 {plan['before']} 分前〜"
-          f"{plan['after']} 分後{note}・おまけ {'あり' if plan['extras'] else 'なし'}", flush=True)
+          f"{plan['after']} 分後{note}・{'/'.join(plan['scripts'])}"
+          f"・おまけ {'あり' if plan['extras'] else 'なし'}", flush=True)
     n = 0
     while True:
         now = dt.datetime.now(JST)
@@ -99,7 +112,7 @@ def main():
         t0 = time.time()
         n += 1
         print(f"===== {a.lane} 周回 {n} {now:%H:%M:%S} =====", flush=True)
-        for script in ("odds_tanfuku.py", "odds_full.py"):
+        for script in plan["scripts"]:
             rc = subprocess.call([sys.executable] + odds_cmd(script, plan), env=env)
             if rc:
                 print(f"  {script} rc={rc}(次の周で取り直す)", flush=True)

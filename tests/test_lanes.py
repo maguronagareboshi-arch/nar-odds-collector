@@ -9,6 +9,8 @@
   ④周回が長引いて境目を割ったレースは相手に任せる(同じ分の行を 2 本作らない)。分けない周回では常に取る
   ⑤loop.py の車線ごとの引数組立= 近い車線は 60 秒・おまけ無し・遠い車線は --min-before 付き・
     分けない(既定)は 1 本で回していたときと同じ引数
+  ⑥ §234 朝の車線= 発走 5 時間前は対象・35 分前は対象外(far に任せる)・発走後は対象外。
+    30 分ごと・単複だけ・おまけ無し・上限 60
 """
 import sys
 import unittest
@@ -24,6 +26,7 @@ from odds_full import MIN_BEFORE_OFF, out_of_lane                    # noqa: E40
 NOW = 12 * 60                      # 12:00
 FAR = {"before": 40, "after": 8, "min_before": 10}      # 遠い車線(120 秒ごと)
 HOT = {"before": 10, "after": 8, "min_before": MIN_BEFORE_OFF}   # 近い車線(60 秒ごと)
+MORNING = {"before": 600, "after": 0, "min_before": 40}   # 朝の車線(1800 秒ごと・単複だけ)
 
 
 def race(delta, no):
@@ -106,7 +109,8 @@ class LoopLaneTest(unittest.TestCase):
         self.assertEqual(lane_plan("all")["every"], 120)
         self.assertEqual(lane_plan("far")["every"], 120)
         self.assertEqual(lane_plan("hot")["every"], 60)
-        self.assertEqual(sorted(LANES), ["all", "far", "hot"])
+        self.assertEqual(lane_plan("morning")["every"], 1800)
+        self.assertEqual(sorted(LANES), ["all", "far", "hot", "morning"])
 
     def test_default_lane_is_todays_command(self):
         # ⛔1 本で回していたときと 1 文字も変えない
@@ -138,6 +142,45 @@ class LoopLaneTest(unittest.TestCase):
     def test_explicit_flags_win(self):
         plan = lane_plan("hot", every=30, before=12, after=4, min_before=2)
         self.assertEqual((plan["every"], plan["before"], plan["after"], plan["min_before"]), (30, 12, 4, 2))
+
+
+class MorningLaneTest(unittest.TestCase):
+    """⑥ §234 朝の車線(発走 600 分前〜40 分前・30 分ごと・単複だけ)"""
+
+    def test_window(self):
+        # 発走 5 時間前= 対象 / 35 分前= 対象外(far が取る) / 発走後 5 分= 対象外
+        races = [race(300, 1), race(35, 2), race(-5, 3), race(41, 4), race(601, 5)]
+        for mod in (odds_tanfuku, odds_full):
+            got = picked(mod, MORNING, races)
+            self.assertIn(1, got, mod.__name__ + ": 発走 5 時間前を取っていない")
+            self.assertIn(4, got, mod.__name__ + ": 残り 41 分を取っていない")
+            self.assertNotIn(2, got, mod.__name__ + ": 残り 35 分を朝の車線が取っている")
+            self.assertNotIn(3, got, mod.__name__ + ": 発走後を朝の車線が取っている")
+            self.assertNotIn(5, got, mod.__name__ + ": 600 分より前を取っている")
+
+    def test_no_overlap_with_far(self):
+        """朝と far は重ならない(同じ分に同じレースの行を 2 本作らない)"""
+        races = [race(d, d + 1000) for d in range(-9, 610)]
+        for mod in (odds_tanfuku, odds_full):
+            morning, far = set(picked(mod, MORNING, races)), set(picked(mod, FAR, races))
+            self.assertEqual(morning & far, set(), mod.__name__ + ": 朝の車線と far が同じレースを取っている")
+
+    def test_command_is_tanfuku_only_with_a_bigger_limit(self):
+        plan = lane_plan("morning")
+        self.assertEqual(plan["scripts"], ("odds_tanfuku.py",))
+        self.assertEqual(odds_cmd("odds_tanfuku.py", plan),
+                         ["odds_tanfuku.py", "--before", "600", "--after", "0", "--limit", "60",
+                          "--min-before", "40"])
+
+    def test_no_extras(self):
+        plan = lane_plan("morning")
+        for n in range(1, 16):
+            self.assertEqual(extra_cmds(plan, n), [], f"朝の車線の周回 {n} におまけが混ざっている")
+
+    def test_other_lanes_still_run_both_scripts(self):
+        for lane in ("all", "far", "hot"):
+            self.assertEqual(lane_plan(lane)["scripts"], ("odds_tanfuku.py", "odds_full.py"))
+            self.assertEqual(lane_plan(lane)["limit"], 40)
 
 
 if __name__ == "__main__":
