@@ -43,7 +43,7 @@ jobs:
         id: list
         env:
           MONTHS: ${{ github.event.inputs.months }}
-        run: python rakuten_backfill.py --list-months "$MONTHS" >> "$GITHUB_OUTPUT"
+        run: python rakuten_backfill.py --list-months "$MONTHS" | grep "^months=" >> "$GITHUB_OUTPUT"
   backfill:
     needs: plan
     runs-on: ubuntu-latest
