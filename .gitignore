@@ -1,2 +1,5 @@
 .results_state.json
 __pycache__/
+out/
+docs/opus_*.md
+docs/proposal_*.md
