@@ -1,54 +1,79 @@
-# 過去の開催(2014-01 〜 2022-10)を 1 か月ずつ遡って取る手動の便。1 秒 1 ページ・並列なし。
-# 1 回 5.5 時間で自分から止まり、続きは同じ年月でもう一度起こす(進み具合は nar_meta に残る)。
-# ⛔最初の手順で取得元のトップを 1 回だけ GET し、走らせている場所から見えるか(海外 IP 拒否でないか)を確かめる。
+# 過去の開催(2014-01 〜 2022-10)を遡って取る手動の便。月ごとに別のジョブへ分け、同時に動かすのは 10 本まで。
+# ⛔1 本のジョブの中は今までどおり 1 秒 1 ページ・並列なし。1 ジョブ 90 分で自分から止まり、続きは
+# 同じ月をもう一度起こす(進み具合は nar_meta 'rakuten_backfill:v1' に残る・何度流しても行は増えない)。
+# ⛔最初の小さなジョブで取得元のトップを 1 回だけ GET し、走らせている場所から見えるか(海外 IP 拒否でないか)を確かめる。
 # Secrets: SUPABASE_URL / SUPABASE_SERVICE_KEY(任意: COLLECTOR_UA / COLLECTOR_CONTACT)
 name: rakuten-backfill
 on:
   workflow_dispatch:
     inputs:
-      year_month:
-        description: 'YYYY-MM (2014-01 .. 2022-10)'
+      months:
+        description: '2014-01..2022-10 (range) or 2022-10,2022-09 (list)'
         required: true
+        default: '2022-10'
       since:
-        description: 'YYYY-MM-DD to resume from (empty - use nar_meta)'
+        description: 'YYYY-MM-DD to resume from (single month only, empty - use nar_meta)'
         required: false
         default: ''
       dry:
         description: 'dry run (no writes)'
         required: false
         default: 'false'
-concurrency:
-  group: rakuten-backfill
-  cancel-in-progress: false
 permissions:
   contents: read
 jobs:
-  backfill:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 5
+    outputs:
+      months: ${{ steps.list.outputs.months }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: "reachability check - one GET of the source top page"
+        env:
+          COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' -A "${COLLECTOR_UA:-nar-backfill/1.0}" https://keiba.rakuten.co.jp/)
           echo "top page status $code"
           test "$code" = "200"
+      - name: "expand the months input into a list"
+        id: list
         env:
-          COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
-      - name: "backfill one month - 1 page per second, stops after 5.5 hours"
+          MONTHS: ${{ github.event.inputs.months }}
+        run: python rakuten_backfill.py --list-months "$MONTHS" >> "$GITHUB_OUTPUT"
+  backfill:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      max-parallel: 10
+      fail-fast: false
+      matrix:
+        month: ${{ fromJSON(needs.plan.outputs.months) }}
+    concurrency:
+      group: rakuten-${{ matrix.month }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: "backfill one month - 1 page per second, stops after 80 minutes"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
           COLLECTOR_CONTACT: ${{ secrets.COLLECTOR_CONTACT }}
-          YM: ${{ github.event.inputs.year_month }}
+          YM: ${{ matrix.month }}
           SINCE: ${{ github.event.inputs.since }}
           DRY: ${{ github.event.inputs.dry }}
+          MONTH_COUNT: ${{ strategy.job-total }}
         run: |
-          args="--year-month $YM --max-seconds 19800"
-          if [ -n "$SINCE" ]; then args="$args --since $SINCE"; fi
+          args="--year-month $YM --max-seconds 4800"
+          # 続きの日付は月を 1 本だけ指定したときにしか意味が無い(他の月に当ててはいけない)
+          if [ -n "$SINCE" ] && [ "$MONTH_COUNT" = "1" ]; then args="$args --since $SINCE"; fi
           if [ "$DRY" = "true" ]; then args="$args --dry"; fi
           python rakuten_backfill.py $args

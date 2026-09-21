@@ -309,6 +309,93 @@ class ExtIds(unittest.TestCase):
         self.assertEqual((merged[0]["first_seen"], merged[0]["last_seen"]),
                          ("2022-10-01", "2022-10-30"))
 
+class Idempotence(unittest.TestCase):
+    """⛔同じ月をもう一度回しても行が増えない土台= upsert の on_conflict が主キーと同じこと。"""
+
+    def setUp(self):
+        import rakuten_backfill as rb                                # noqa: PLC0415
+        self.rb = rb
+
+    def test_conflict_matches_primary_key(self):
+        self.assertEqual(self.rb.conflict_mismatches(), [])
+
+    def test_primary_key_matches_the_sql_we_ship(self):
+        """新しい 2 表は sql/ の primary key の宣言と同じか。"""
+        sql = (Path(__file__).resolve().parents[1] / "sql" /
+               "rakuten_backfill_20260921.sql").read_text(encoding="utf-8")
+        for table in ("nar_race_votes", "nar_horse_ext_ids"):
+            block = sql.split(f"create table if not exists public.{table}", 1)[1].split(");", 1)[0]
+            declared = re.search(r"primary key \(([^)]+)\)", block).group(1)
+            self.assertEqual(declared.replace(" ", ""), self.rb.PRIMARY_KEYS[table], table)
+
+    def test_every_table_has_a_key(self):
+        for name, (table, _) in self.rb.KEYS.items():
+            self.assertIn(table, self.rb.PRIMARY_KEYS, name)
+
+
+class Months(unittest.TestCase):
+    def setUp(self):
+        import rakuten_backfill as rb                                # noqa: PLC0415
+        self.rb = rb
+
+    def test_range(self):
+        got = self.rb.expand_months("2014-01..2022-10")
+        self.assertEqual(len(got), 106)
+        self.assertEqual((got[0], got[-1]), ("2022-10", "2014-01"))
+
+    def test_list_and_bounds(self):
+        # 公式 ZIP のある 2022-11 以降と下限より前は落とす・同じ月は 1 度だけ
+        self.assertEqual(self.rb.expand_months("2022-10,2022-09,2022-11,2013-12,2022-10"),
+                         ["2022-10", "2022-09"])
+        self.assertEqual(self.rb.expand_months("2022-09..2022-07"),
+                         ["2022-09", "2022-08", "2022-07"])
+
+    def test_bad_input(self):
+        with self.assertRaises(SystemExit):
+            self.rb.expand_months("2022/10")
+        with self.assertRaises(SystemExit):
+            self.rb.expand_months("2023-01")
+
+
+class Retry(unittest.TestCase):
+    """429 / 503 は 60 秒あけて出直す(最大 5 回)・回数を数える。"""
+
+    def fetcher(self, codes):
+        import rakuten_backfill as rb                                # noqa: PLC0415
+        import urllib.error                                          # noqa: PLC0415
+        slept = []
+        f = rb.Fetcher(sleep=slept.append)
+        left = list(codes)
+
+        def once(url, data):
+            f.count += 1
+            if left:
+                raise urllib.error.HTTPError(url, left.pop(0), "x", None, None)
+            return "ok"
+
+        f._once = once
+        return f, slept
+
+    def test_retries_then_succeeds(self):
+        f, slept = self.fetcher([429, 503])
+        self.assertEqual(f.get("http://x"), "ok")
+        self.assertEqual((f.retries, f.waited), (2, 120))
+        self.assertEqual(slept, [60, 60])
+
+    def test_gives_up_after_five(self):
+        import urllib.error                                          # noqa: PLC0415
+        f, _ = self.fetcher([429] * 6)
+        with self.assertRaises(urllib.error.HTTPError):
+            f.get("http://x")
+        self.assertEqual(f.retries, 5)
+
+    def test_other_codes_are_not_retried(self):
+        import urllib.error                                          # noqa: PLC0415
+        f, _ = self.fetcher([404])
+        with self.assertRaises(urllib.error.HTTPError):
+            f.get("http://x")
+        self.assertEqual(f.retries, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

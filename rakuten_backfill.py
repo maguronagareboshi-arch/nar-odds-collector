@@ -21,6 +21,7 @@ import calendar
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -54,6 +55,62 @@ KEYS = {
 TABLES = ("races", "runs", "payouts", "votes", "ext_ids")
 RUN_TS = dt.datetime.now(dt.timezone.utc).isoformat()
 
+# 冪等(何度流しても行が増えない)の土台= upsert の on_conflict が**主キーと同じ**であること。
+# 入れ先の主キー(2026-09-21 に本番で確認・新しい 2 表は sql/rakuten_backfill_20260921.sql の宣言)。
+PRIMARY_KEYS = {
+    "nar_races": "track,race_date,race_no",
+    "nar_runs": "track,race_date,race_no,runner_number",
+    "nar_race_payouts": "track,race_date,race_no",
+    "nar_race_votes": "track,race_date,race_no",
+    "nar_horse_ext_ids": "source,ext_id",
+    "nar_meta": "key",
+}
+
+
+def conflict_mismatches():
+    """upsert の on_conflict と主キーが違う所を返す(空= 全部そろっている)。"""
+    bad = []
+    for name, (table, conflict) in KEYS.items():
+        want = PRIMARY_KEYS.get(table)
+        if want != conflict:
+            bad.append(f"{name}: {table} on_conflict={conflict} / 主キー={want}")
+    if PRIMARY_KEYS["nar_meta"] != "key":
+        bad.append("nar_meta: 進み具合の upsert は key でぶつける")
+    return bad
+
+
+# ---------------------------------------------------------------- 月の一覧(便を月ごとに分ける)
+
+def expand_months(text, first="2014-01", last="2022-10"):
+    """'2014-01..2022-10' か '2022-10,2022-09' → 新しい月から順の一覧。
+
+    ⛔範囲の外(公式 ZIP のある 2022-11 以降・下限より前)は落とす。同じ月は 1 度だけ。
+    """
+    out = []
+    for part in str(text or "").replace("　", " ").replace(" ", "").split(","):
+        if not part:
+            continue
+        if ".." in part:
+            a, b = part.split("..", 1)
+            lo, hi = min(a, b), max(a, b)
+            y, m = (int(x) for x in lo.split("-"))
+            while f"{y:04d}-{m:02d}" <= hi:
+                out.append(f"{y:04d}-{m:02d}")
+                y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        else:
+            out.append(part)
+    seen, kept = set(), []
+    for ym in out:
+        if not re.fullmatch(r"\d{4}-\d{2}", ym):
+            raise SystemExit(f"⛔月の書き方が違う: {ym}(YYYY-MM)")
+        if ym < first or ym > last or ym in seen:
+            continue
+        seen.add(ym)
+        kept.append(ym)
+    if not kept:
+        raise SystemExit(f"⛔取れる月が無い({first} 〜 {last} の中で指定する)")
+    return sorted(kept, reverse=True)
+
 
 def log(msg):
     print(f"[{dt.datetime.now(JST):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
@@ -61,21 +118,32 @@ def log(msg):
 
 # ---------------------------------------------------------------- 通信(1 秒 1 ページ)
 
-class Fetcher:
-    """取得の窓口。間隔を必ずあけ、取った枚数を数える(⛔並列にしない)。"""
+RETRY_CODES = (429, 503)       # 「ちょっと待って」= 60 秒あけて出直す
+RETRY_WAIT = 60
+RETRY_MAX = 5
 
-    def __init__(self, gap=GAP, budget=None):
+
+class Fetcher:
+    """取得の窓口。間隔を必ずあけ、取った枚数を数える(⛔並列にしない)。
+
+    429 / 503 が返ったら 60 秒待って出直す(最大 5 回)。待った回数は最後に報告する。
+    """
+
+    def __init__(self, gap=GAP, budget=None, sleep=time.sleep):
         self.gap = max(GAP, float(gap))
         self.budget = budget
         self.count = 0
+        self.retries = 0
+        self.waited = 0
         self.last = 0.0
+        self._sleep = sleep
 
     def _wait(self):
         rest = self.gap - (time.time() - self.last)
         if rest > 0:
-            time.sleep(rest)
+            self._sleep(rest)
 
-    def get(self, url, data=None):
+    def _once(self, url, data):
         if self.budget is not None and self.count >= self.budget:
             raise RuntimeError(f"取得の上限 {self.budget} ページに達した")
         self._wait()
@@ -90,6 +158,20 @@ class Fetcher:
         if status != 200:
             raise RuntimeError(f"HTTP{status} {url}")
         return body.decode("utf-8", "replace")
+
+    def get(self, url, data=None):
+        for attempt in range(RETRY_MAX + 1):
+            try:
+                return self._once(url, data)
+            except urllib.error.HTTPError as e:
+                if e.code not in RETRY_CODES or attempt >= RETRY_MAX:
+                    raise
+                self.retries += 1
+                self.waited += RETRY_WAIT
+                log(f"  HTTP{e.code}= {RETRY_WAIT} 秒あけて出直す({attempt + 1}/{RETRY_MAX})")
+                self._sleep(RETRY_WAIT)
+                self.last = time.time()
+        raise RuntimeError("到達しない")
 
 
 def fetch_calendar(fetcher, year, month):
@@ -377,6 +459,8 @@ def resume_from(url, key, ym):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--year-month", help="YYYY-MM")
+    ap.add_argument("--list-months", metavar="RANGE",
+                    help="'2014-01..2022-10' か カンマ区切り → 月の一覧を GitHub Actions の出力の形で印刷")
     ap.add_argument("--horse-check", metavar="YYYY-MM-DD", help="馬 ID の照合だけ(⛔書かない)")
     ap.add_argument("--dry", action="store_true", help="投入しない(整形済み JSON を out/ に置く)")
     ap.add_argument("--max-seconds", type=int, default=19800, help="これを過ぎたら途中でやめる(既定 5.5 時間)")
@@ -395,6 +479,15 @@ def main():
         load_env(a.env)
     url = (a.url or os.environ.get("SUPABASE_URL", "")).rstrip("/")
     key = a.key or os.environ.get("SUPABASE_SERVICE_KEY", "")
+    if a.list_months:
+        months = expand_months(a.list_months)
+        print("months=" + json.dumps(months, ensure_ascii=False))
+        log(f"月の一覧 {len(months)} 本({months[0]} 〜 {months[-1]})")
+        return 0
+    bad = conflict_mismatches()
+    if bad:
+        log("⛔upsert の on_conflict が主キーと違う= 冪等にならない: " + " / ".join(bad))
+        return 2
     fetcher = Fetcher(a.gap, a.max_pages)
     t0 = time.time()
 
@@ -442,7 +535,9 @@ def main():
             + f"  取得 {fetcher.count} ページ")
 
     bag["ext_ids"] = merge_ext_ids(bag["ext_ids"])
-    log(f"取得 {fetcher.count} ページ / {time.time() - t0:.0f}s")
+    log(f"取得 {fetcher.count} ページ / {time.time() - t0:.0f}s"
+        + (f" / 429・503 で待ち直した回数 {fetcher.retries}(合計 {fetcher.waited} 秒)" if fetcher.retries
+           else " / 429・503 での待ち直し 0 回"))
     for k in TABLES:
         log(f"  {k:8s} {len(bag[k]):>8,} 行")
     if total["dropped"]:
