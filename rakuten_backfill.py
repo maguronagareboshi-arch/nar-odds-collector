@@ -6,7 +6,8 @@
   py -3.12 rakuten_backfill.py --horse-check 2022-11-01            # 馬 ID の照合だけ(⛔書かない)
 
 順= カレンダー(その月の開催日と RACEID)→ 払戻の日ページ(1 日 1 場)→ 成績のレースページ → upsert。
-入れ先= nar_races / nar_runs / nar_race_payouts / nar_race_votes。進み具合は nar_meta 'rakuten_backfill:v1'。
+入れ先= nar_races / nar_runs / nar_race_payouts / nar_race_votes / nar_horse_ext_ids(楽天の馬 ID)。
+進み具合は nar_meta 'rakuten_backfill:v1'。
 
 ⛔守ること
   ・1 秒 1 ページ・並列なし(--gap で伸ばせる。縮められない)。生 HTML は保存しない(--dry の整形済み JSON だけ)。
@@ -48,8 +49,9 @@ KEYS = {
     "runs": ("nar_runs", "track,race_date,race_no,runner_number"),
     "payouts": ("nar_race_payouts", "track,race_date,race_no"),
     "votes": ("nar_race_votes", "track,race_date,race_no"),
+    "ext_ids": ("nar_horse_ext_ids", "source,ext_id"),
 }
-TABLES = ("races", "runs", "payouts", "votes")
+TABLES = ("races", "runs", "payouts", "votes", "ext_ids")
 RUN_TS = dt.datetime.now(dt.timezone.utc).isoformat()
 
 
@@ -167,6 +169,35 @@ def payout_row(track, race_date, race_no, payouts):
             "payouts": payouts, "updated_at": RUN_TS}
 
 
+def ext_id_row(race_date, run):
+    """楽天の馬 ID を捨てずに残す 1 行(nar_horse_ext_ids)。⛔nar_runs には列を足さない。
+
+    ID は先頭の 0 が落ちて 9 桁で出ることがあるので 10 桁に 0 詰めする。3〜6 桁目は登録の年らしい
+    数字で**生年ではない**(2022-11-01 大井 154 頭で公式の生年と 0/154 一致)= そのまま入れるだけ。
+    """
+    raw = run.get("horse_id")
+    if not raw or not str(raw).isdigit():
+        return None
+    ext = str(raw).zfill(10)
+    year = int(ext[2:6]) if ext[2:6].isdigit() else None
+    return {"source": SOURCE, "ext_id": ext, "horse_name": run.get("horse_name"),
+            "birth_year": year, "first_seen": race_date, "last_seen": race_date,
+            "updated_at": RUN_TS}
+
+
+def merge_ext_ids(rows):
+    """同じ ID が月内に何度も出るので 1 行に畳む(見た日の幅を広げる)。"""
+    out = {}
+    for r in rows:
+        cur = out.get(r["ext_id"])
+        if cur is None:
+            out[r["ext_id"]] = r
+            continue
+        cur["first_seen"] = min(cur["first_seen"], r["first_seen"])
+        cur["last_seen"] = max(cur["last_seen"], r["last_seen"])
+    return list(out.values())
+
+
 def votes_row(track, race_date, race_no, votes, refunds):
     return {"track": track, "race_date": race_date, "race_no": race_no,
             "votes": votes, "refunds": refunds, "source": SOURCE, "updated_at": RUN_TS}
@@ -200,6 +231,7 @@ def collect_day(fetcher, day, want_perf=True):
             continue
         bag["races"].append(race_row(track, date, no, p["race"]))
         bag["runs"] += run_rows(track, date, no, p["runs"])
+        bag["ext_ids"] += [x for x in (ext_id_row(date, r) for r in p["runs"]) if x]
         stat["races"] += 1
         stat["runs"] += len(p["runs"])
     return bag, stat
@@ -409,6 +441,7 @@ def main():
             + ("" if want_perf else "(成績は取らない)")
             + f"  取得 {fetcher.count} ページ")
 
+    bag["ext_ids"] = merge_ext_ids(bag["ext_ids"])
     log(f"取得 {fetcher.count} ページ / {time.time() - t0:.0f}s")
     for k in TABLES:
         log(f"  {k:8s} {len(bag[k]):>8,} 行")
@@ -440,7 +473,7 @@ def main():
         log(f"  {tbl}: 投入 {len(rows):,} 行")
     save_meta(url, key, a.year_month, {
         "days": total["days"], "races": total["races"], "runs": total["runs"],
-        "payouts": len(bag["payouts"]), "votes": len(bag["votes"]),
+        "payouts": len(bag["payouts"]), "votes": len(bag["votes"]), "ext_ids": len(bag["ext_ids"]),
         "perf_missing": total["perf_missing"], "pages": fetcher.count,
         "stopped_at": stopped, "done": stopped is None, "updated_at": RUN_TS,
     })

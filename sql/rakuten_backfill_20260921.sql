@@ -29,3 +29,46 @@ create policy nar_race_votes_read on public.nar_race_votes
   for select to anon, authenticated using (true);
 
 grant select on public.nar_race_votes to anon, authenticated;
+
+-- 3) 新しい表 nar_horse_ext_ids = よそのサイトが馬に付けている ID を捨てずに残す置き場。
+--    ⛔nar_runs には列を足さない(その表を読む全員に影響が出るため)。別の表として置く。
+--    楽天の ID は血統登録番号ではない(2022-11-01 大井 154 頭で公式の生年と 0/154 一致)。同名馬を
+--    分ける手がかりとして残すだけで、今は誰も読まない。birth_year は ID の 3〜6 桁目(登録の年らしい
+--    数字)をそのまま入れる= ⛔生年として使わない。
+
+create table if not exists public.nar_horse_ext_ids (
+  source     text not null,          -- 'rakuten'
+  ext_id     text not null,          -- 10 桁(先頭の 0 が落ちるので 0 詰めして入れる)
+  horse_name text,
+  birth_year int,
+  first_seen date,
+  last_seen  date,
+  updated_at timestamptz not null default now(),
+  primary key (source, ext_id)
+);
+
+create index if not exists nar_horse_ext_ids_name_idx on public.nar_horse_ext_ids (horse_name);
+
+alter table public.nar_horse_ext_ids enable row level security;
+
+drop policy if exists nar_horse_ext_ids_read on public.nar_horse_ext_ids;
+create policy nar_horse_ext_ids_read on public.nar_horse_ext_ids
+  for select to anon, authenticated using (true);
+
+grant select on public.nar_horse_ext_ids to anon, authenticated;
+
+-- 便は新しい月から古い月へ遡るので、upsert がそのまま上書きすると last_seen が古い日に戻ってしまう。
+-- 見た日の**幅**が広がるだけにする(何度流しても同じ結果)。
+create or replace function public.nar_horse_ext_ids_widen() returns trigger
+language plpgsql as $$
+begin
+  new.first_seen := least(coalesce(new.first_seen, old.first_seen), coalesce(old.first_seen, new.first_seen));
+  new.last_seen  := greatest(coalesce(new.last_seen, old.last_seen), coalesce(old.last_seen, new.last_seen));
+  new.horse_name := coalesce(new.horse_name, old.horse_name);
+  new.birth_year := coalesce(new.birth_year, old.birth_year);
+  return new;
+end $$;
+
+drop trigger if exists nar_horse_ext_ids_widen_trg on public.nar_horse_ext_ids;
+create trigger nar_horse_ext_ids_widen_trg before update on public.nar_horse_ext_ids
+  for each row execute function public.nar_horse_ext_ids_widen();

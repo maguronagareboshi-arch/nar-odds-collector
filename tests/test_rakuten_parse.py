@@ -105,12 +105,12 @@ class Dividend(unittest.TestCase):
         self.assertIn({"t": "trio", "c": "4-5-6", "y": 180, "p": 1}, got)
         self.assertIn({"t": "wide", "c": "4-5", "y": 140, "p": 2}, got)
         # 発売の無い券種('-')は行にしない
-        self.assertEqual([p for p in got if p["t"].startswith("bracket")], [])
+        self.assertEqual([p for p in got if p["t"].startswith("waku")], [])   # 高知は枠の発売なし
         self.assertEqual(got, sorted(got, key=lambda p: (p["t"], p["c"])))
 
     def test_votes(self):
         v, r = self.day[1]["votes"], self.day[1]["refunds"]
-        self.assertEqual(sorted(v), sorted(rp.TICKETS.values()))
+        self.assertEqual(sorted(v), sorted(rp.VOTE_KEYS.values()))
         self.assertEqual(v["win"], 21518)
         self.assertEqual(v["trifecta"], 86255)
         self.assertEqual(v["bracket_exacta"], 0)
@@ -120,7 +120,19 @@ class Dividend(unittest.TestCase):
         old = rp.parse_dividend_day(fixture("dividend_kawasaki_20140102.html"))
         self.assertEqual(sorted(old), list(range(1, 13)))
         self.assertTrue(old[1]["payouts"])
-        self.assertEqual(sorted(old[1]["votes"]), sorted(rp.TICKETS.values()))
+        self.assertEqual(sorted(old[1]["votes"]), sorted(rp.VOTE_KEYS.values()))
+
+    def test_bracket_tickets_are_kept(self):
+        """⛔枠複/枠単は公式の払戻に無い券種。落とさずに 'wakuren'/'wakutan' で同じ JSON に足す。"""
+        old = rp.parse_dividend_day(fixture("dividend_kawasaki_20140102.html"))
+        self.assertIn({"t": "wakuren", "c": "1-7", "y": 180, "p": 1}, old[2]["payouts"])
+        self.assertIn({"t": "wakutan", "c": "7-1", "y": 290, "p": 1}, old[2]["payouts"])
+        # 枠複は順が無い= 小さい順 / 枠単は出た順のまま
+        self.assertEqual([p["c"] for p in old[3]["payouts"] if p["t"] == "wakuren"], ["6-8"])
+        self.assertEqual([p["c"] for p in old[7]["payouts"] if p["t"] == "wakutan"], ["7-5"])
+        # 公式と同じ 7 種の鍵は変えていない
+        self.assertEqual({p["t"] for p in old[2]["payouts"]} - {"wakuren", "wakutan"},
+                         {"win", "place", "quinella", "exacta", "wide", "trio", "trifecta"})
 
 
 class Performance(unittest.TestCase):
@@ -264,6 +276,38 @@ class Formats(unittest.TestCase):
         self.assertIsNone(rp.combination("quinella", "5"))
         self.assertIsNone(rp.combination("quinella", "5-5"))
         self.assertIsNone(rp.combination("win", "-"))
+
+
+
+
+class ExtIds(unittest.TestCase):
+    """⛔楽天の馬 ID は捨てずに別の表(nar_horse_ext_ids)へ。nar_runs には列を足さない。"""
+
+    def setUp(self):
+        import rakuten_backfill as rb                                # noqa: PLC0415(通信はしない)
+        self.rb = rb
+
+    def test_row(self):
+        runs = rp.parse_performance(fixture("perf_ooi_20221101_1r.html"), "大井")["runs"]
+        rows = [self.rb.ext_id_row("2022-11-01", r) for r in runs]
+        self.assertTrue(all(rows))
+        for row in rows:
+            self.assertEqual(len(row["ext_id"]), 10)                 # 9 桁は 0 詰め
+            self.assertEqual(row["source"], "rakuten")
+            self.assertEqual(row["first_seen"], row["last_seen"])
+        self.assertIn("0820210091", [r["ext_id"] for r in rows])     # 先頭の 0 が落ちていた馬
+        self.assertEqual([r["birth_year"] for r in rows if r["ext_id"] == "0820210091"], [2021])
+
+    def test_skip_and_merge(self):
+        self.assertIsNone(self.rb.ext_id_row("2022-11-01", {"horse_id": None}))
+        merged = self.rb.merge_ext_ids([
+            {"ext_id": "1", "first_seen": "2022-10-05", "last_seen": "2022-10-05"},
+            {"ext_id": "1", "first_seen": "2022-10-01", "last_seen": "2022-10-01"},
+            {"ext_id": "1", "first_seen": "2022-10-30", "last_seen": "2022-10-30"},
+            {"ext_id": "2", "first_seen": "2022-10-02", "last_seen": "2022-10-02"}])
+        self.assertEqual(len(merged), 2)
+        self.assertEqual((merged[0]["first_seen"], merged[0]["last_seen"]),
+                         ("2022-10-01", "2022-10-30"))
 
 
 if __name__ == "__main__":

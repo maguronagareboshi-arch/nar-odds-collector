@@ -17,14 +17,18 @@ import re
 
 BANEI = "帯広ば"
 
-# 楽天の券種名 → 公式(nar_official_csv.TICKET_NAMES)の値。枠複/枠単は公式の払戻には無い券種(足して残す)
+# 楽天の券種名 → 払戻(nar_race_payouts の "t")の鍵。7 つは公式 nar_official_csv.TICKET_NAMES と同じ値。
+# 枠複/枠単は公式の払戻に**無い**(2026-09-21 に本番の鍵を確認= 7 種だけ)。⛔落とさずに 'wakuren'/'wakutan'
+# の鍵で同じ JSON に足す(既にある 7 種の鍵は変えない)。
 TICKETS = {
-    "単勝": "win", "複勝": "place", "枠複": "bracket_quinella", "枠単": "bracket_exacta",
+    "単勝": "win", "複勝": "place", "枠複": "wakuren", "枠単": "wakutan",
     "馬複": "quinella", "馬単": "exacta", "ワイド": "wide", "三連複": "trio", "三連単": "trifecta",
 }
-UNORDERED = {"quinella", "wide", "trio", "bracket_quinella"}
+# 票数(nar_race_votes)の鍵だけは**既にある nar_sales の列名**にそろえる(同じ読み手で両方引けるように)。
+VOTE_KEYS = dict(TICKETS, **{"枠複": "bracket_quinella", "枠単": "bracket_exacta"})
+UNORDERED = {"quinella", "wide", "trio", "wakuren"}
 WIDTH = {"win": 1, "place": 1, "quinella": 2, "exacta": 2, "wide": 2,
-         "bracket_quinella": 2, "bracket_exacta": 2, "trio": 3, "trifecta": 3}
+         "wakuren": 2, "wakutan": 2, "trio": 3, "trifecta": 3}
 
 ZEN = str.maketrans("０１２３４５６７８９／　", "0123456789/ ")
 ZEN_DIGIT = str.maketrans("０１２３４５６７８９", "0123456789")
@@ -148,12 +152,12 @@ def parse_votes_block(block):
     for part in (m.group(1), m.group(2)):
         cur = {}
         for name, num in VOTE_RE.findall(part):
-            kind = TICKETS.get(name.strip())
+            kind = VOTE_KEYS.get(name.strip())
             if kind:
                 cur[kind] = int(num.replace(",", ""))
             else:
                 dropped.append(name.strip())
-        got.append({k: cur.get(k, 0) for k in TICKETS.values()})
+        got.append({k: cur.get(k, 0) for k in VOTE_KEYS.values()})
     return got[0], got[1], sorted(set(dropped))
 
 
