@@ -247,22 +247,36 @@ def save_meta(url, key, ym, summary):
 
 # ---------------------------------------------------------------- 馬 ID の照合(⛔書かない)
 
-def horse_check(fetcher, url, key, date):
-    """公式と重なる 1 日を楽天から取り、楽天の馬 ID 10 桁が nar の何と合うかを数える(読むだけ)。"""
-    y, m, _ = date.split("-")
-    days = [d for d in fetch_calendar(fetcher, int(y), int(m)) if d["race_date"] == date]
-    log(f"{date} の開催 {[d['track'] for d in days]}")
+def horse_check(fetcher, url, key, date, tracks=None, cache=None):
+    """公式と重なる 1 日を楽天から取り、公式の nar_runs と列ごとに突き合わせる(⛔読むだけ)。
+
+    cache= 一度取った整形済みの行を置くファイル(同じ日を数え直すときに取り直さないため)。
+    """
     rows = []
-    for day in days:
-        div = rp.parse_dividend_day(fetcher.get(DIVIDEND + day["raceid"]))
-        for no in sorted(div):
-            page = fetcher.get(PERFORMANCE + rp.race_id_for(day["raceid"], no))
-            for r in rp.parse_performance(page, day["track"])["runs"]:
-                rows.append({"track": day["track"], "race_no": no, **r})
-    official = sb_get(url, key, "nar_runs?select=track,race_no,runner_number,horse_name,birth_date"
-                                f"&race_date=eq.{date}")
+    if cache and Path(cache).exists():
+        rows = json.loads(Path(cache).read_text(encoding="utf-8"))
+        log(f"{date}: 取り直さずに {cache} の {len(rows)} 頭を使う")
+    else:
+        y, m, _ = date.split("-")
+        days = [d for d in fetch_calendar(fetcher, int(y), int(m)) if d["race_date"] == date]
+        if tracks:
+            days = [d for d in days if d["track"] in tracks]
+        log(f"{date} の開催 {[d['track'] for d in days]}")
+        for day in days:
+            div = rp.parse_dividend_day(fetcher.get(DIVIDEND + day["raceid"]))
+            for no in sorted(div):
+                page = fetcher.get(PERFORMANCE + rp.race_id_for(day["raceid"], no))
+                for r in rp.parse_performance(page, day["track"])["runs"]:
+                    rows.append({"track": day["track"], "race_no": no, **r})
+        if cache:
+            Path(cache).write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    cols = ("horse_name", "sex", "age", "jockey", "trainer", "carried_weight", "weight_mark",
+            "body_weight", "body_weight_change", "finish", "time_raw", "margin", "last3f", "popularity")
+    official = sb_get(url, key, "nar_runs?select=track,race_no,runner_number,birth_date,"
+                                + ",".join(cols) + f"&race_date=eq.{date}")
     off = {(o["track"], o["race_no"], o["runner_number"]): o for o in official}
-    same_name = year_ok = both = 0
+    both = year_ok = 0
+    same = {c: 0 for c in cols}
     misses = []
     for r in rows:
         o = off.get((r["track"], r["race_no"], r["runner_number"]))
@@ -270,19 +284,37 @@ def horse_check(fetcher, url, key, date):
             misses.append(("公式に無い", r["track"], r["race_no"], r["runner_number"], r["horse_name"]))
             continue
         both += 1
-        if o["horse_name"] == r["horse_name"]:
-            same_name += 1
-        else:
-            misses.append(("馬名が違う", r["track"], r["race_no"], r["runner_number"],
-                           f"{r['horse_name']} / {o['horse_name']}"))
+        for c in cols:
+            a, b = r.get(c), o.get(c)
+            if _eq(a, b):
+                same[c] += 1
+            else:
+                misses.append((c, r["track"], r["race_no"], r["runner_number"], f"楽天 {a!r} / 公式 {b!r}"))
         hid = r.get("horse_id") or ""
         if len(hid) == 10 and o.get("birth_date") and hid[2:6] == o["birth_date"][:4]:
             year_ok += 1
     log(f"楽天 {len(rows)} 頭 / 公式 {len(official)} 頭 / 同じ(場,R,馬番) {both} 頭")
-    log(f"  馬名が一致 {same_name}/{both} ・ 馬 ID の 3〜6 桁目が生年と一致 {year_ok}/{both}")
-    for kind, tr, no, num, what in misses[:20]:
-        log(f"  ⚠{kind}: {tr} {no}R {num}番 {what}")
+    log(f"  馬 ID 10 桁の 3〜6 桁目が公式の生年と一致 {year_ok}/{both}")
+    for c in cols:
+        log(f"  {c:20s} 一致 {same[c]:>5,}/{both:,} ({same[c] / both * 100:5.1f}%)" if both else c)
+    shown = {}
+    for kind, tr, no, num, what in misses:
+        shown.setdefault(kind, []).append(f"{tr} {no}R {num}番 {what}")
+    for kind, examples in shown.items():
+        log(f"  ⚠{kind}: {len(examples)} 件 / 例 " + " ; ".join(examples[:3]))
     return 0
+
+
+def _eq(a, b):
+    """楽天の値と公式の値が同じか。数字は数として比べる(公式は数字を文字で返す列がある)。"""
+    if a is None or a == "":
+        return b is None or b == ""
+    if b is None or b == "":
+        return False
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return str(a) == str(b)
 
 
 # ---------------------------------------------------------------- 本体
@@ -319,6 +351,8 @@ def main():
     ap.add_argument("--gap", type=float, default=GAP, help="取得の間隔(秒・既定 1.0。縮まらない)")
     ap.add_argument("--max-pages", type=int, help="取得の上限ページ数(手元の検証用)")
     ap.add_argument("--perf-days", type=int, help="成績を取る「日×場」の数の上限(手元の検証用)")
+    ap.add_argument("--tracks", help="--horse-check で場を絞る(カンマ区切り)")
+    ap.add_argument("--cache", help="--horse-check の整形済みの行の置き場(あれば取り直さない)")
     ap.add_argument("--since", metavar="YYYY-MM-DD", help="この日から続ける(既定は nar_meta の続き)")
     ap.add_argument("--out", default="out", help="--dry のときの置き場")
     ap.add_argument("--env")
@@ -335,7 +369,8 @@ def main():
     if a.horse_check:
         if not url or not key:
             log("SUPABASE_URL / SUPABASE_SERVICE_KEY が無い(照合は公式の行を読む)"); return 2
-        return horse_check(fetcher, url, key, a.horse_check)
+        return horse_check(fetcher, url, key, a.horse_check,
+                           (a.tracks or "").split(",") if a.tracks else None, a.cache)
 
     if not a.year_month:
         log("--year-month か --horse-check が要る"); return 2

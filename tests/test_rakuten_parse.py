@@ -179,6 +179,41 @@ class Performance(unittest.TestCase):
         self.assertEqual(self.old["runs"][0]["body_weight_change"], -8)
 
 
+class MarksAndSex(unittest.TestCase):
+    """⛔公式は減量の記号を「負担重量」に、楽天は「騎手名」に付ける。公式と同じ列へ移すこと。
+    ⛔公式のセン馬は 'セン'、楽天は 'セ'。(2022-11-01 大井 1R= 公式と重なる日で答え合わせした 1 レース)"""
+
+    def setUp(self):
+        self.runs = rp.parse_performance(fixture("perf_ooi_20221101_1r.html"), "大井")["runs"]
+        self.by = {r["runner_number"]: r for r in self.runs}
+
+    def test_mark_moves_to_weight_mark(self):
+        self.assertEqual(self.by[3]["weight_mark"], "▲")
+        self.assertEqual(self.by[3]["jockey"], "田中洸")        # 記号は騎手名に残さない
+        self.assertEqual(self.by[3]["carried_weight"], 51.0)
+        self.assertEqual(self.by[1]["weight_mark"], "△")
+        self.assertEqual(self.by[1]["jockey"], "新原周")
+        self.assertIsNone(self.by[9]["weight_mark"])
+        self.assertEqual(sum(1 for r in self.runs if r["weight_mark"]), 3)
+
+    def test_official_row_matches(self):
+        # 公式 nar_runs(2022-11-01 大井 1R 1番)の実際の行と同じ値になる
+        r = self.by[1]
+        self.assertEqual(r["horse_name"], "サブノスカイ")
+        self.assertEqual((r["sex"], r["age"]), ("牝", 5))
+        self.assertEqual((r["body_weight"], r["body_weight_change"]), (450, 19))
+        self.assertEqual((r["finish"], r["time_raw"], r["time_sec"]), (13, "1467", 106.7))
+        self.assertEqual((r["margin"], r["last3f"], r["popularity"]), ("4", 42.2, 13))
+        self.assertEqual((r["jockey"], r["trainer"]), ("新原周", "上杉昌"))
+
+    def test_sen(self):
+        self.assertEqual(rp.parse_performance(fixture("perf_ooi_20221101_1r.html"), "大井")["runs"][0]["sex"],
+                         "牝")
+        self.assertEqual(rp.parse_runs("<div id=\"oddsField\"><tr data-grouping=\"1\">"
+                                       "<td class=\"number\">1</td><td class=\"state\">セ5 /鹿毛</td>"
+                                       "</tr></table>")[0]["sex"], "セン")
+
+
 class Corners(unittest.TestCase):
     """⛔本体 pipeline/facts.py の規則で 100% 読めること(読めない並びが 1 つでもあれば落ちる)。"""
 

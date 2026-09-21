@@ -296,11 +296,16 @@ def parse_runs(page):
         if margin and NOTE_RE.search(margin):
             note, margin = margin, None
         state = text(cell.get("state", ""))
+        # 公式は 牡/牝/セン。楽天は「セ」1 字で出す
+        state = re.sub(r"^セ(?![ン])", "セン", state)
         sexage = re.match(r"([牡牝せセンセ騸]+)\s*(\d+)", state)
         weight = lines(cell.get("weight", ""))
         jockey = lines(cell.get("jockey", ""))
         wt = text(cell.get("weightTax", ""))
         mark = re.match(r"^[^\d.]+", wt)
+        # ⛔公式は減量の記号(◇☆▲★△)を「負担重量」の頭に付けるが、楽天は**騎手名の頭**に付ける。
+        #   公式と同じ列(weight_mark)に移し、騎手名は記号を外す(2022-11-01 大井で 27/154 が該当)。
+        jmark = re.match(r"^[^\w぀-ヿ一-鿿]+", jockey[0]) if jockey else None
         time_raw = norm_time(text(cell.get("time", "")))
         hid = HORSEID_RE.search(cell.get("horse", "") or "")
         out.append({
@@ -309,9 +314,10 @@ def parse_runs(page):
             "horse_id": hid.group(1) if hid else None,
             "sex": sexage.group(1) if sexage else None,
             "age": int(sexage.group(2)) if sexage else None,
-            "jockey": jockey[0] if jockey else None,
+            "jockey": (jockey[0][jmark.end():] if jmark else jockey[0]) if jockey else None,
             "trainer": text(cell.get("tamer", "")) or None,
-            "carried_weight": to_num(wt), "weight_mark": mark.group(0) if mark else None,
+            "carried_weight": to_num(wt),
+            "weight_mark": mark.group(0) if mark else (jmark.group(0) if jmark else None),
             "body_weight": to_int(weight[0]) if weight else None,
             "body_weight_change": to_int(weight[1]) if len(weight) > 1 else None,
             "finish": finish, "finish_note": note,
