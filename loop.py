@@ -134,7 +134,10 @@ def main():
         n += 1
         print(f"===== {a.lane} 周回 {n} {now:%H:%M:%S} =====", flush=True)
         for script in plan["scripts"]:
-            rc = bounded_child(odds_cmd(script, plan), env, deadline)
+            cmd = odds_cmd(script, plan)
+            if n == 1 and script == "odds_full.py":
+                cmd = cmd + ["--announce"]          # §245 最初の周回だけ、その日の場一覧をログに出す
+            rc = bounded_child(cmd, env, deadline)
             if rc is None:
                 print("収集の実行枠が終了。成果物保存のため正常終了", flush=True)
                 return 0

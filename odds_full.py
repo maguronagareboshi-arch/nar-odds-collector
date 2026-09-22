@@ -121,6 +121,12 @@ def _num(text):
     return float(m.group(0)) if m else None
 
 
+def _num_second(text):
+    """'1.3<br>-1.6' → 1.6(2 つ目の数)。数が 1 つしか無ければ None。§245 ワイドの上限用。"""
+    ms = re.findall(r"\d+(?:\.\d+)?", str(text or ""))
+    return float(ms[1]) if len(ms) >= 2 else None
+
+
 def post_minutes(post_time):
     """'1420' → 860(JST の分)。読めなければ None。"""
     m = re.fullmatch(r"(\d{2})(\d{2})", str(post_time or "").strip())
@@ -298,7 +304,8 @@ def parse_ranking(page):
                 dropped += 1                                # 取消・「発売前」など数値でない行
                 continue
             nums = tuple(int(g) for g in combo.groups() if g is not None)
-            out.append((nums, float(odds), int(rank)))
+            hi = _num_second(tds[1])                        # §245 ワイドの「下限<br>-上限」= 2 つ目の数(他の券種は None)
+            out.append((nums, float(odds), int(rank)) if hi is None else (nums, float(odds), int(rank), hi))
     return out, dropped
 
 
@@ -352,11 +359,30 @@ def has_odds(rows):
     return False
 
 
+def tracks_summary(races):
+    """§245 起動ログ用= '門別 12R・浦和 12R・高知 10R'(場の並びは公式の一覧どおり)。開催が無ければ '(開催なし)'。"""
+    counts = {}
+    for r in races or []:
+        t = str(r.get("track") or "").strip()
+        if t:
+            counts[t] = counts.get(t, 0) + 1
+    return "・".join(f"{t} {n}R" for t, n in counts.items()) if counts else "(開催なし)"
+
+
 def combos_json(kind, rows):
-    """保存形。2連系 [[a,b,odds,rank]] / 3連系 [[a,b,c,odds,rank]] / 枠連 [[i,j,odds]]。"""
+    """保存形。2連系 [[a,b,odds,rank]] / 3連系 [[a,b,c,odds,rank]] / 枠連 [[i,j,odds]]。
+    §245 ワイドは [[a,b,下限,rank,上限]]= 先頭 4 つは今までどおり(古い読み手はそのまま読める)・上限を末尾に足す。
+    """
     if kind in ("wakuren", "wakutan"):
         return rows
-    return [list(nums) + [odds, rank] for nums, odds, rank in rows]
+    out = []
+    for r in rows:
+        nums, odds, rank = r[0], r[1], r[2]
+        row = list(nums) + [odds, rank]
+        if len(r) > 3 and r[3] is not None:
+            row.append(r[3])
+        out.append(row)
+    return out
 
 
 def combos_h(kind, rows):
@@ -573,6 +599,8 @@ def main():
     ap.add_argument("--min-before", type=int, default=MIN_BEFORE_OFF,
                     help="発走までの残りがこれ以下は取らない(既定=分けない。もう一方の車線に任せるとき用)")
     ap.add_argument("--limit", type=int, default=10, help="1回の実行で取るレース数の上限(既定10)")
+    ap.add_argument("--announce", action="store_true",
+                    help="§245 その日の場一覧(場ごとのレース数)をログに 1 行出す(loop.py が最初の周回だけ付ける)")
     ap.add_argument("--save-fixtures", metavar="DIR",
                     help="取得した生HTMLを DIR/<場>_<R>R/ に保存する(処理したレースぶん全部)")
     args = ap.parse_args()
@@ -593,6 +621,8 @@ def main():
     except Exception as e:
         log(f"nar_races の読み取りに失敗: {type(e).__name__}: {str(e)[:200]}")
         return 2
+    if args.announce:
+        log("対象の場: " + tracks_summary(races))
     # 既に全券種の最終が入っているレースを飛ばすための**下読み**。⛔ここは best-effort:
     # 表がまだ無い(SQL 未適用)ときは 404 になるが、取り直すだけで害は無い(upsert は何度流しても同じ)。
     # ⚠**書き込みの失敗は rc 1 のまま**= 表が無ければ投入で必ず落ちる(黙って成功しない)
