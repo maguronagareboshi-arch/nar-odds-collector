@@ -4,6 +4,8 @@
   py -3.12 rakuten_backfill.py --year-month 2022-10 --dry          # 取って整えるだけ(out/ に JSON)
   py -3.12 rakuten_backfill.py --year-month 2022-10                # 投入(SUPABASE_URL / SUPABASE_SERVICE_KEY)
   py -3.12 rakuten_backfill.py --horse-check 2022-11-01            # 馬 ID の照合だけ(⛔書かない)
+  py -3.12 rakuten_backfill.py --date 2026-09-21 --votes-only      # §238c 前日の票数だけ(1 日 1 場 1 ページ)
+  py -3.12 rakuten_backfill.py --year-month 2022-11 --votes-only   # 票数だけの遡り(公式のある月でも取る)
 
 順= カレンダー(その月の開催日と RACEID)→ 払戻の日ページ(1 日 1 場)→ 成績のレースページ → upsert。
 入れ先= nar_races / nar_runs / nar_race_payouts / nar_race_votes / nar_horse_ext_ids(楽天の馬 ID)。
@@ -42,6 +44,8 @@ TIMEOUT = 30
 GAP = 1.0                      # ⛔1 秒 1 ページ
 OFFICIAL_FROM = "2022-11-01"   # これ以降は公式 ZIP がある= 取らない
 META_KEY = "rakuten_backfill:v1"
+# §238c 票数だけの便の進み具合。⛔遡り便の進み具合(META_KEY)と混ぜない(別の便・別の範囲)
+VOTES_META_KEY = "rakuten_votes:v1"
 SOURCE = "rakuten"
 BATCH = 500
 
@@ -110,6 +114,16 @@ def expand_months(text, first="2014-01", last="2022-10"):
     if not kept:
         raise SystemExit(f"⛔取れる月が無い({first} 〜 {last} の中で指定する)")
     return sorted(kept, reverse=True)
+
+
+def pick_tables(votes_only):
+    """upsert する表。⛔票数だけの便は nar_race_votes しか書かない(公式の払戻・成績を上書きしない)。"""
+    return ("votes",) if votes_only else TABLES
+
+
+def meta_key(votes_only):
+    """進み具合を書く nar_meta の鍵。⛔遡り便と票数の便で別の鍵にする。"""
+    return VOTES_META_KEY if votes_only else META_KEY
 
 
 def log(msg):
@@ -287,8 +301,12 @@ def votes_row(track, race_date, race_no, votes, refunds):
 
 # ---------------------------------------------------------------- 1 日 1 場を集める
 
-def collect_day(fetcher, day, want_perf=True):
-    """1 日 1 場 → (4 表の行, 数えたもの)。払戻の日ページ 1 枚 + 成績のレース枚数ぶん取る。"""
+def collect_day(fetcher, day, want_perf=True, votes_only=False):
+    """1 日 1 場 → (5 表の行, 数えたもの)。払戻の日ページ 1 枚 + 成績のレース枚数ぶん取る。
+
+    ⛔votes_only(§238c)= 払戻の日ページ 1 枚だけ取り、**票数の行しか作らない**。払戻は公式 ZIP に
+      あるので上書きしない(票数は 2022-11 以降の公式 ZIP に無いので、ここでしか取れない)。
+    """
     track, date, rid = day["track"], day["race_date"], day["raceid"]
     bag = {k: [] for k in TABLES}
     div = rp.parse_dividend_day(fetcher.get(DIVIDEND + rid))
@@ -296,10 +314,11 @@ def collect_day(fetcher, day, want_perf=True):
     for no in sorted(div):
         d = div[no]
         stat["dropped"] += d.get("dropped") or []
-        bag["payouts"].append(payout_row(track, date, no, d["payouts"]))
+        if not votes_only:
+            bag["payouts"].append(payout_row(track, date, no, d["payouts"]))
         if d["votes"]:
             bag["votes"].append(votes_row(track, date, no, d["votes"], d["refunds"]))
-        if not want_perf:
+        if votes_only or not want_perf:
             continue
         try:
             page = fetcher.get(PERFORMANCE + rp.race_id_for(rid, no))
@@ -345,16 +364,16 @@ def print_missing(table):
 
 # ---------------------------------------------------------------- 進み具合(nar_meta)
 
-def save_meta(url, key, ym, summary):
+def save_meta(url, key, ym, summary, key_name=META_KEY):
     try:
-        cur = sb_get(url, key, f"nar_meta?select=value&key=eq.{urllib.parse.quote(META_KEY)}")
+        cur = sb_get(url, key, f"nar_meta?select=value&key=eq.{urllib.parse.quote(key_name)}")
         value = (cur[0]["value"] if cur else {}) or {}
     except Exception as e:                           # noqa: BLE001
         log(f"  ⚠nar_meta を読めない({type(e).__name__})= 今回の月だけ書く")
         value = {}
     value[ym] = summary
     st, msg = upsert(url, key, "nar_meta", "key",
-                     [{"key": META_KEY, "value": value, "updated_at": RUN_TS}])
+                     [{"key": key_name, "value": value, "updated_at": RUN_TS}])
     if st >= 300 or st == 0:
         log(f"  ⚠nar_meta の記録に失敗 status={st} {msg}")
 
@@ -433,22 +452,40 @@ def _eq(a, b):
 
 # ---------------------------------------------------------------- 本体
 
-def month_days(fetcher, ym, since=None, skip_from=OFFICIAL_FROM):
-    """その月の「日×場」。⛔公式 ZIP のある日(skip_from 以降)は落とす。since 以降だけ残す(続きから)。"""
+def month_days(fetcher, ym, since=None, skip_from=OFFICIAL_FROM, votes_only=False, today=None):
+    """その月の「日×場」。⛔公式 ZIP のある日(skip_from 以降)は落とす。since 以降だけ残す(続きから)。
+
+    ⛔votes_only(§238c)= 票数は公式 ZIP に無いので skip_from を外す(公式のある月でも取る)。
+    ⛔今日より後の日は取らない(結果がまだ無い)。
+    """
     y, m = (int(x) for x in ym.split("-"))
-    if f"{y:04d}-{m:02d}-01" >= skip_from:
+    if votes_only:
+        skip_from = None
+    if skip_from and f"{y:04d}-{m:02d}-01" >= skip_from:
         raise SystemExit(f"⛔{ym} は公式 ZIP のある期間({skip_from} 以降)= 取らない")
     last = f"{y:04d}-{m:02d}-{calendar.monthrange(y, m)[1]:02d}"
-    if last >= skip_from:
+    if skip_from and last >= skip_from:
         log(f"⛔{skip_from} 以降は公式 ZIP があるので取らない({ym} の後半を落とす)")
+    hi = today or f"{dt.datetime.now(JST).date()}"
     return [d for d in fetch_calendar(fetcher, y, m)
-            if d["race_date"] < skip_from and (since is None or d["race_date"] >= since)]
+            if (skip_from is None or d["race_date"] < skip_from) and d["race_date"] <= hi
+            and (since is None or d["race_date"] >= since)]
 
 
-def resume_from(url, key, ym):
+def date_days(fetcher, date, votes_only=False, skip_from=OFFICIAL_FROM):
+    """1 日ぶんの「日×場」(§238c の毎日便)。⛔票数だけのときは公式のある日でも取る。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date or "")):
+        raise SystemExit(f"⛔日付の書き方が違う: {date}(YYYY-MM-DD)")
+    if not votes_only and date >= skip_from:
+        raise SystemExit(f"⛔{date} は公式 ZIP のある期間({skip_from} 以降)= --votes-only でだけ取れる")
+    y, m, _d = date.split("-")
+    return [d for d in fetch_calendar(fetcher, int(y), int(m)) if d["race_date"] == date]
+
+
+def resume_from(url, key, ym, key_name=META_KEY):
     """nar_meta の進み具合 → その月をどこから続けるか(終わっていれば None)。"""
     try:
-        cur = sb_get(url, key, f"nar_meta?select=value&key=eq.{urllib.parse.quote(META_KEY)}")
+        cur = sb_get(url, key, f"nar_meta?select=value&key=eq.{urllib.parse.quote(key_name)}")
     except Exception as e:                           # noqa: BLE001
         log(f"  ⚠nar_meta を読めない({type(e).__name__})= 月の頭から")
         return None
@@ -459,6 +496,9 @@ def resume_from(url, key, ym):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--year-month", help="YYYY-MM")
+    ap.add_argument("--date", metavar="YYYY-MM-DD", help="§238c その 1 日だけ(毎日便)")
+    ap.add_argument("--votes-only", action="store_true",
+                    help="§238c 払戻の日ページだけ取り、nar_race_votes だけ書く(公式のある日でも取る)")
     ap.add_argument("--list-months", metavar="RANGE",
                     help="'2014-01..2022-10' か カンマ区切り → 月の一覧を GitHub Actions の出力の形で印刷")
     ap.add_argument("--horse-check", metavar="YYYY-MM-DD", help="馬 ID の照合だけ(⛔書かない)")
@@ -480,7 +520,10 @@ def main():
     url = (a.url or os.environ.get("SUPABASE_URL", "")).rstrip("/")
     key = a.key or os.environ.get("SUPABASE_SERVICE_KEY", "")
     if a.list_months:
-        months = expand_months(a.list_months)
+        # ⛔票数だけの便は範囲が逆= 公式 ZIP に票数が無い 2022-11 以降〜当月
+        months = (expand_months(a.list_months, first=OFFICIAL_FROM[:7],
+                                last=f"{dt.datetime.now(JST):%Y-%m}")
+                  if a.votes_only else expand_months(a.list_months))
         print("months=" + json.dumps(months, ensure_ascii=False))
         log(f"月の一覧 {len(months)} 本({months[0]} 〜 {months[-1]})")
         return 0
@@ -497,15 +540,25 @@ def main():
         return horse_check(fetcher, url, key, a.horse_check,
                            (a.tracks or "").split(",") if a.tracks else None, a.cache)
 
-    if not a.year_month:
-        log("--year-month か --horse-check が要る"); return 2
+    if not a.year_month and not a.date:
+        log("--year-month / --date / --horse-check のどれかが要る"); return 2
+    if a.year_month and a.date:
+        log("⛔--year-month と --date は同時に指定しない"); return 2
     if not a.dry and (not url or not key):
         log("SUPABASE_URL / SUPABASE_SERVICE_KEY が無い"); return 2
 
-    since = a.since or (resume_from(url, key, a.year_month) if (url and key and not a.dry) else None)
-    days = month_days(fetcher, a.year_month, since)
-    log(f"{a.year_month}: 開催 {len(days)} 日×場" + (f"({since} から続き)" if since else "")
-        + f" / User-Agent={UA}")
+    votes_only = a.votes_only
+    tables = pick_tables(votes_only)
+    mkey = meta_key(votes_only)
+    span = a.date or a.year_month
+    if a.date:
+        since, days = None, date_days(fetcher, a.date, votes_only)
+    else:
+        since = a.since or (resume_from(url, key, a.year_month, mkey)
+                            if (url and key and not a.dry) else None)
+        days = month_days(fetcher, a.year_month, since, votes_only=votes_only)
+    log(f"{span}: 開催 {len(days)} 日×場" + (f"({since} から続き)" if since else "")
+        + ("(票数だけ)" if votes_only else "") + f" / User-Agent={UA}")
     bag = {k: [] for k in TABLES}
     total = {"races": 0, "runs": 0, "perf_missing": 0, "days": 0, "dropped": set()}
     stopped = None
@@ -514,9 +567,9 @@ def main():
             stopped = day["race_date"]
             log(f"時間切れ({a.max_seconds}s)= {stopped} の手前でやめる(続きは次の回)")
             break
-        want_perf = a.perf_days is None or total["days"] < a.perf_days
+        want_perf = (not votes_only) and (a.perf_days is None or total["days"] < a.perf_days)
         try:
-            got, stat = collect_day(fetcher, day, want_perf)
+            got, stat = collect_day(fetcher, day, want_perf, votes_only)
         except Exception as e:                       # noqa: BLE001(1 日落ちても月は続ける)
             log(f"  ⚠{day['track']} {day['race_date']} が取れない: {type(e).__name__}: {str(e)[:120]}")
             if "上限" in str(e):
@@ -529,16 +582,17 @@ def main():
         for k in ("races", "runs", "perf_missing"):
             total[k] += stat[k]
         total["dropped"] |= set(stat["dropped"])
-        log(f"  [{i}/{len(days)}] {day['race_date']} {day['track']}: 払戻 {len(got['payouts'])} R"
-            f" / 成績 {stat['races']} R {stat['runs']} 頭"
-            + ("" if want_perf else "(成績は取らない)")
+        log(f"  [{i}/{len(days)}] {day['race_date']} {day['track']}: 票数 {len(got['votes'])} R"
+            + ("" if votes_only else f" / 払戻 {len(got['payouts'])} R"
+               f" / 成績 {stat['races']} R {stat['runs']} 頭")
+            + ("" if want_perf or votes_only else "(成績は取らない)")
             + f"  取得 {fetcher.count} ページ")
 
     bag["ext_ids"] = merge_ext_ids(bag["ext_ids"])
     log(f"取得 {fetcher.count} ページ / {time.time() - t0:.0f}s"
         + (f" / 429・503 で待ち直した回数 {fetcher.retries}(合計 {fetcher.waited} 秒)" if fetcher.retries
            else " / 429・503 での待ち直し 0 回"))
-    for k in TABLES:
+    for k in tables:
         log(f"  {k:8s} {len(bag[k]):>8,} 行")
     if total["dropped"]:
         log(f"  ⚠読めない券種名 {sorted(total['dropped'])}")
@@ -550,29 +604,30 @@ def main():
     if a.dry:
         out = Path(a.out)
         out.mkdir(parents=True, exist_ok=True)
-        for k in TABLES:
-            (out / f"{a.year_month}_{k}.json").write_text(
+        for k in tables:
+            (out / f"{span}_{k}.json").write_text(
                 json.dumps(bag[k], ensure_ascii=False), encoding="utf-8")
-        (out / f"{a.year_month}_missing.json").write_text(
+        (out / f"{span}_missing.json").write_text(
             json.dumps([{"table": t, "column": c, "rows": n, "missing": m, "rate": round(r, 4)}
                         for t, c, n, m, r in table], ensure_ascii=False, indent=1), encoding="utf-8")
         log(f"--dry: 投入しない。整形済み JSON を {out}/ に置いた(⛔生 HTML は保存していない)")
         return 0
 
-    for k in TABLES:
+    for k in tables:
         rows, (tbl, conflict) = bag[k], KEYS[k]
         for i in range(0, len(rows), BATCH):
             st, msg = upsert(url, key, tbl, conflict, rows[i:i + BATCH])
             if st >= 300 or st == 0:
                 log(f"  {tbl}: HTTP{st} {msg} (batch {i})"); return 1
         log(f"  {tbl}: 投入 {len(rows):,} 行")
-    save_meta(url, key, a.year_month, {
+    save_meta(url, key, span, {
         "days": total["days"], "races": total["races"], "runs": total["runs"],
         "payouts": len(bag["payouts"]), "votes": len(bag["votes"]), "ext_ids": len(bag["ext_ids"]),
         "perf_missing": total["perf_missing"], "pages": fetcher.count,
+        "votes_only": votes_only,
         "stopped_at": stopped, "done": stopped is None, "updated_at": RUN_TS,
-    })
-    log(f"完了 {a.year_month}" + (f"(途中・続きは {stopped} から)" if stopped else ""))
+    }, mkey)
+    log(f"完了 {span}" + (f"(途中・続きは {stopped} から)" if stopped else ""))
     return 0
 
 
