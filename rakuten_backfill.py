@@ -48,6 +48,9 @@ META_KEY = "rakuten_backfill:v1"
 VOTES_META_KEY = "rakuten_votes:v1"
 SOURCE = "rakuten"
 BATCH = 500
+UPSERT_TRIES = 5               # ⛔投入の出直し(2026-09-22= 3 回 3 秒では足りず 10 本捨てになった)
+UPSERT_WAIT = 30               # 出直しの間隔(秒)
+UPSERT_TIMEOUT = 120           # 1 回の待ち(秒)
 
 KEYS = {
     "races": ("nar_races", "track,race_date,race_no"),
@@ -114,6 +117,22 @@ def expand_months(text, first="2014-01", last="2022-10"):
     if not kept:
         raise SystemExit(f"⛔取れる月が無い({first} 〜 {last} の中で指定する)")
     return sorted(kept, reverse=True)
+
+
+def pending_months(months, meta_value):
+    """まだ終わっていない月 → [(月, わけ), ...]。⛔nar_meta の done が True の月だけ落とす。
+
+    わけ= 'まだ' 進み具合が無い / '途中(YYYY-MM-DD から)' 途中で止まった。
+    """
+    got = meta_value or {}
+    out = []
+    for ym in months:
+        m = got.get(ym) or {}
+        if m.get("done") is True:
+            continue
+        stopped = m.get("stopped_at")
+        out.append((ym, f"途中({stopped} から)" if stopped else ("やり直し" if m else "まだ")))
+    return out
 
 
 def pick_tables(votes_only):
@@ -202,24 +221,35 @@ def sb_get(url, key, path):
         return json.loads(r.read().decode("utf-8"))
 
 
-def upsert(url, key, table, conflict, rows):
+def upsert(url, key, table, conflict, rows, sleep=time.sleep):
+    """⛔投入は 5 回まで・30 秒あけて出直す(2026-09-22 の事故)。
+
+    9/22 に 10 本を同時に流して本番が重くなり、1 か月ぶん取り終えた後の最初の投入が
+    「read operation timed out」= 3 秒あけて 3 回では足りず、10 本とも捨てになった。
+    出直すのは **時間切れ(HTTP0)と 5xx** だけ。4xx は出直しても直らないのでそのまま返す。
+    """
     body = json.dumps(rows, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         f"{url}/rest/v1/{table}?on_conflict={conflict}", data=body, method="POST",
         headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json",
                  "Prefer": "resolution=merge-duplicates,return=minimal", "User-Agent": UA})
-    for attempt in range(3):
+    for attempt in range(UPSERT_TRIES):
+        last = attempt == UPSERT_TRIES - 1
         try:
-            with urllib.request.urlopen(req, timeout=90) as r:
+            with urllib.request.urlopen(req, timeout=UPSERT_TIMEOUT) as r:
                 return r.status, ""
         except urllib.error.HTTPError as e:
             msg = e.read().decode()[:300]
-            if e.code >= 500 and attempt < 2:
-                time.sleep(3 * (attempt + 1)); continue
+            if e.code >= 500 and not last:
+                log(f"  ⚠{table} の投入をやり直す {attempt + 1}/{UPSERT_TRIES}"
+                    f"(HTTP{e.code}・{UPSERT_WAIT} 秒待つ)")
+                sleep(UPSERT_WAIT); continue
             return e.code, msg
         except Exception as e:                       # noqa: BLE001(通信は何が来ても再試行)
-            if attempt < 2:
-                time.sleep(3 * (attempt + 1)); continue
+            if not last:
+                log(f"  ⚠{table} の投入をやり直す {attempt + 1}/{UPSERT_TRIES}"
+                    f"({type(e).__name__}・{UPSERT_WAIT} 秒待つ)")
+                sleep(UPSERT_WAIT); continue
             return 0, str(e)
 
 
@@ -501,6 +531,8 @@ def main():
                     help="§238c 払戻の日ページだけ取り、nar_race_votes だけ書く(公式のある日でも取る)")
     ap.add_argument("--list-months", metavar="RANGE",
                     help="'2014-01..2022-10' か カンマ区切り → 月の一覧を GitHub Actions の出力の形で印刷")
+    ap.add_argument("--pending", action="store_true",
+                    help="--list-months に足す= nar_meta の進み具合で done でない月だけ残す(失敗月の一覧)")
     ap.add_argument("--horse-check", metavar="YYYY-MM-DD", help="馬 ID の照合だけ(⛔書かない)")
     ap.add_argument("--dry", action="store_true", help="投入しない(整形済み JSON を out/ に置く)")
     ap.add_argument("--max-seconds", type=int, default=19800, help="これを過ぎたら途中でやめる(既定 5.5 時間)")
@@ -524,6 +556,25 @@ def main():
         months = (expand_months(a.list_months, first=OFFICIAL_FROM[:7],
                                 last=f"{dt.datetime.now(JST):%Y-%m}")
                   if a.votes_only else expand_months(a.list_months))
+        if a.pending:
+            if not url or not key:
+                log("⛔--pending は SUPABASE_URL / SUPABASE_SERVICE_KEY が要る(進み具合を読む)")
+                return 2
+            mkey = meta_key(a.votes_only)
+            try:
+                cur = sb_get(url, key, f"nar_meta?select=value&key=eq.{urllib.parse.quote(mkey)}")
+            except Exception as e:                   # noqa: BLE001
+                log(f"⛔nar_meta '{mkey}' を読めない({type(e).__name__})")
+                return 2
+            rest = pending_months(months, (cur[0]["value"] if cur else {}) or {})
+            log(f"終わっていない月 {len(rest)} 本 / 指定 {len(months)} 本(鍵 {mkey})")
+            for ym, why in rest:
+                log(f"  {ym}  {why}")
+            months = [ym for ym, _ in rest]
+            if not months:
+                print("months=[]")
+                log("⛔終わっていない月は無い= 流すものが無い")
+                return 0
         print("months=" + json.dumps(months, ensure_ascii=False))
         log(f"月の一覧 {len(months)} 本({months[0]} 〜 {months[-1]})")
         return 0
