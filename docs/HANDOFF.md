@@ -1,13 +1,7 @@
-commit: 7b9c12a・b8f8805 枝 s238c(origin/main f8c7f02 から)。設計= docs/proposal_s238c_coverage_20260922.md §3。⛔push なし・本番への書き込み 0・鍵は読んでいない。
-
-作った物= rakuten_backfill.py に --date と --votes-only / tests/test_votes_only.py 8 本(全 91 本 ALL PASS)/ votes-daily.yml(cron 20:40 UTC= 05:40 JST・前日)/ votes-backfill.yml(months・月ごと matrix・10 並列)。
-
---votes-only= 払戻の日ページ 1 枚だけ取り、書くのは nar_race_votes だけ(pick_tables が表を絞る)。払戻・成績・馬 ID は作らない= 公式のある日でも公式を上書きしない。票数の無いレースは行を作らない(⛔0 で埋めない)。
-
-公式のある期間の扱い= date_days / month_days は votes_only のとき OFFICIAL_FROM の門を外す(票数は 2022-11 以降の公式 ZIP に無いため)。votes_only なしの今までの遡りは門も出力も不変(tests で確認)。今日より後の日は取らない。
-
-進み具合= nar_meta 'rakuten_votes:v1'(⛔遡り便の 'rakuten_backfill:v1' と混ぜない)。--list-months --votes-only は範囲を 2022-11〜当月に読み替える。冪等の確認(on_conflict=主キー)は今までどおり起動時に走る。
-
-検品(--date 2026-09-21 --votes-only --dry)= 取得 5 ページ 4 秒(1 秒 1 ページ)・票数 43 R・作った表は votes だけ。答え合わせ= 本番 nar_races 同日の場ごとの数(佐賀 9・帯広ば 12・水沢 12・金沢 10)と 43/43 一致。
-
-⚠毎日便は 05:40 JST に 1 回・約 5 ページ 2 分(Actions の分数は月 60 分ほど)。未了= 本番に 1 行も書いていない。要判断= ①Secrets は既存 SUPABASE_URL/SERVICE_KEY 流用でよいか ②過去分は votes-backfill を months=2022-11..2026-09(47 本)で 1 回流すか。
+commit: 3283c54 / 720752d (枝 s238c2 / origin/main から・push なし)
+検品: 通信なしの検算のみ= `py -3.12 -m unittest discover -s tests -p "test_*.py"` 99 本 ALL PASS(新 9 本)・yml は PyYAML で読めて手順名に「: 」なし。⛔本番 DB には触っていない
+通信: +0(取得元へのアクセスは 1 秒 1 ページのまま。同時に動く月の本数を 10→3 に既定変更= 本番 DB への同時書き込みは減る)
+回帰: 触ったのは票数の便だけ / 毎日便 votes-daily・遡り便 rakuten-backfill への影響= upsert の出直しが 3 回 3 秒→5 回 30 秒になる(強くなる方向)
+変えた点: rakuten_backfill.py= ①upsert は時間切れ(HTTP0)と 5xx を 30 秒あけて 5 回まで出直す・4xx は出直さない②--list-months --votes-only --pending= done でない月だけ出す / votes-backfill.yml= max_parallel(既定 3)・pending 入力 / tests 90→99 本
+⚠: 9/22 の run 35670546144 の失敗 10 本は**取り消しのせいではない**= 10 本とも 1 か月ぶん取り終えた後の nar_race_votes 投入が「HTTP0 The read operation timed out (batch 0)」で rc=1。取れた月= 2025-12〜2026-09 の 10 本だけ
+要判断: push の可否(公開リポはユーザー)。流し直しは votes-backfill を months=2022-11..2026-09・pending=true・max_parallel=3 で 1 本(残り 37 本= 失敗 10 本 2025-02〜2025-11 と 取り消し 27 本 2022-11〜2025-01)
