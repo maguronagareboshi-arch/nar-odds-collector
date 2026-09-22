@@ -1,0 +1,71 @@
+# §238c 票数の遡り(手動便)。2022-11 以降は公式 ZIP に票数が無いので、ここだけ取得元から取る。
+# ⛔書くのは nar_race_votes だけ(払戻・成績は公式があるので上書きしない)。
+# 月ごとに別のジョブへ分け、同時に動かすのは 10 本まで。⛔1 本の中は 1 秒 1 ページ・並列なし。
+# 1 か月は 1 日 1 場 1 ページ(約 150〜250 ページ= 3〜5 分)。進み具合は nar_meta 'rakuten_votes:v1'。
+# Secrets: SUPABASE_URL / SUPABASE_SERVICE_KEY(任意: COLLECTOR_UA / COLLECTOR_CONTACT)
+name: votes-backfill
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: '2022-11..2026-09 (range) or 2022-11,2022-12 (list)'
+        required: true
+        default: '2022-11'
+      dry:
+        description: 'dry run (no writes)'
+        required: false
+        default: 'false'
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      months: ${{ steps.list.outputs.months }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: "reachability check - one GET of the source top page"
+        env:
+          COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -A "${COLLECTOR_UA:-nar-backfill/1.0}" https://keiba.rakuten.co.jp/)
+          echo "top page status $code"
+          test "$code" = "200"
+      - name: "expand the months input into a list"
+        id: list
+        env:
+          MONTHS: ${{ github.event.inputs.months }}
+        run: python rakuten_backfill.py --list-months "$MONTHS" --votes-only | grep "^months=" >> "$GITHUB_OUTPUT"
+  votes:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      max-parallel: 10
+      fail-fast: false
+      matrix:
+        month: ${{ fromJSON(needs.plan.outputs.months) }}
+    concurrency:
+      group: votes-${{ matrix.month }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: "collect one month of votes - 1 page per second"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
+          COLLECTOR_CONTACT: ${{ secrets.COLLECTOR_CONTACT }}
+          YM: ${{ matrix.month }}
+          DRY: ${{ github.event.inputs.dry }}
+        run: |
+          args="--year-month $YM --votes-only --max-seconds 4800"
+          if [ "$DRY" = "true" ]; then args="$args --dry"; fi
+          python rakuten_backfill.py $args
