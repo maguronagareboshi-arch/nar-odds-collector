@@ -5,6 +5,9 @@ name: collect
 # 起動の保険: GitHub の schedule は遅れたり抜けたりするので、JST 09:58〜21:58 の 20 分おきに全部起こす。
 # 同時に走るのは 1 本だけ(走行中なら後続は 1 本だけ待機し、前の便が終わった時点で後を継ぐ。
 # 終了時刻を過ぎていれば loop.py がすぐ終わる)。→ どれか 1 本でも起きればループが続く。
+# 走行機ごと弾かれたとき(2026-09-23 16:11〜17:28: 1 台にだけ keiba.go.jp が全ページ 404)は、loop.py が 3 分で
+# 気づいて 3 車線そろって抜ける(rc 75)→ 下の「hand off」が次の便を起こし、別の走行機が継ぐ。
+# 走行機が固まって抜けられないときは、本番 DB の見張りが rescue.yml を起こして外から取り消す。
 on:
   schedule:
     - cron: '58 0-12 * * *'   # JST 09:58, 10:58, ... 21:58
@@ -21,6 +24,7 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: read
+  actions: write   # 走行機ごと弾かれたとき、次の便を自分で起こす(gh workflow run)
 jobs:
   odds:
     runs-on: ubuntu-latest
@@ -31,6 +35,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: "loop (morning every 30 min / far every 2 min / hot every 1 min)"
+        id: loop
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -41,10 +46,30 @@ jobs:
           H=$(TZ=Asia/Tokyo date +%H%M)
           if [ -n "$UNTIL_IN" ]; then U="$UNTIL_IN"; elif [ $((10#$H)) -lt 1530 ]; then U=1600; else U=2200; fi
           echo "JST $H -> $U"
+          rm -f .runner-blocked
           python loop.py --until "$U" --lane morning &
+          M=$!
           python loop.py --until "$U" --lane far &
-          python loop.py --until "$U" --lane hot
-          wait
+          F=$!
+          python loop.py --until "$U" --lane hot &
+          T=$!
+          # 3 本とも待つ。75= 走行機ごと弾かれたので抜けた(失敗にしない= 下で次の便を起こす)
+          rc=0
+          for p in "$M" "$F" "$T"; do
+            wait "$p" || { s=$?; [ "$s" -eq 75 ] || rc=$s; }
+          done
+          if [ -f .runner-blocked ]; then
+            echo "blocked=1" >> "$GITHUB_OUTPUT"
+            echo "::warning::keiba.go.jp がこの走行機を弾いた($(cat .runner-blocked))。次の便に渡す"
+          fi
+          exit "$rc"
+      - name: hand off to a fresh runner
+        if: steps.loop.outputs.blocked == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 同じ列(concurrency collect)の後ろに 1 本積む= このジョブが終わるとすぐ別の走行機で走る
+          gh workflow run collect.yml -R "${{ github.repository }}" --ref "${{ github.ref_name }}"
       - name: retain preoff research inputs
         if: always()
         uses: actions/upload-artifact@v4

@@ -17,6 +17,12 @@
 2 分ごとに要らないものは、周回を間引いて回す(オッズの刻みを遅らせないため):
   post_time_refresh.py … 5 周に 1 回(約 10 分)。発走時刻は当日ずれることがある。
   sales_rakuten.py     … 3 周に 1 回(約 6 分)・1 回 1 場。取得元が Crawl-Delay: 60 なので続けて取らない。
+
+走行機ごと弾かれたら別の走行機へ渡す(2026-09-23 16:11〜17:28 実測: 1 台の走行機にだけ keiba.go.jp が
+オッズ・レース一覧・結果の全ページで 404。PC・前後の便は 200= 走行機の IP 次第)。公式は無いレース・開催の
+無い場にも 200 を返す= 404 が続くのは走行機の側。オッズの子が全部 FETCH_BLOCKED(取得が全部通信の失敗)の周が
+BLOCK_AFTER 秒続き、必ずあるページ(当日のレース一覧)も取れなければ、印のファイル(--block-flag)を置いて
+BLOCK_EXIT で抜ける。ほかの車線は印を見て同じく抜ける → collect.yml が次の便を起こし、別の走行機が継ぐ。
 """
 import argparse
 import datetime as dt
@@ -24,6 +30,10 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
+from pathlib import Path
+
+from odds_full import FETCH_BLOCKED, http_get
 
 JST = dt.timezone(dt.timedelta(hours=9))
 
@@ -43,6 +53,12 @@ ODDS_SCRIPTS = ("odds_tanfuku.py", "odds_full.py")
 
 MAX_RUN_SECONDS = 345 * 60  # Leave 15 minutes before GitHub's six-hour hard stop.
 
+BLOCK_AFTER = 180           # 取得が全部失敗した周がこの秒数続いたら、走行機が弾かれていないか確かめる
+BLOCK_EXIT = 75             # 走行機ごと弾かれたので抜けた(collect.yml が次の便を起こす合図)
+BLOCK_FLAG = ".runner-blocked"
+# 必ずあるページ= 当日のレース一覧(公式は開催の無い場にも 200 を返す)。ここも取れなければ走行機の側
+PROBE_URL = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/RaceList"
+
 
 def bounded_child(command, env, deadline):
     """Stop this lane cleanly at its budget, including a slow child request."""
@@ -53,6 +69,59 @@ def bounded_child(command, env, deadline):
         return subprocess.call([sys.executable] + command, env=env, timeout=remaining)
     except subprocess.TimeoutExpired:
         return None
+
+
+class BlockWatch:
+    """取得が全部失敗した周の続き具合。⛔1 本でも rc が FETCH_BLOCKED 以外(取れた・発売前・投入失敗)なら数え直す。"""
+
+    def __init__(self, after=BLOCK_AFTER):
+        self.after = after
+        self.since = None
+        self.cycles = 0
+
+    def feed(self, rcs, now):
+        """1 周ぶんのオッズの子の rc を渡す。走行機を確かめる頃合い(2 周以上・after 秒以上続いた)なら True。"""
+        if rcs and all(rc == FETCH_BLOCKED for rc in rcs):
+            if self.since is None:
+                self.since = now
+            self.cycles += 1
+            return self.cycles >= 2 and now - self.since >= self.after
+        self.reset()
+        return False
+
+    def reset(self):
+        self.since = None
+        self.cycles = 0
+
+
+def probe(timeout=20):
+    """必ずあるページを 1 回取る。取れれば None・取れなければ理由の文字列。"""
+    today = dt.datetime.now(JST).strftime("%Y/%m/%d")
+    url = f"{PROBE_URL}?{urllib.parse.urlencode({'k_raceDate': today, 'k_babaCode': '36'})}"
+    try:
+        http_get(url, timeout=timeout)
+        return None
+    except Exception as e:  # noqa: BLE001 — 何で落ちても「取れない」
+        return f"{type(e).__name__}: {e}"
+
+
+def block_flag_seen(path, started):
+    """ほかの車線が置いた「走行機ごと弾かれた」の印。⛔この車線の起動より前の古い印は見ない。"""
+    try:
+        return os.path.getmtime(path) >= started
+    except OSError:
+        return False
+
+
+def nap(seconds, path, started, step=5):
+    """待つ間もほかの車線の印を見る(朝の車線は 30 分待つ= そのままだと抜けるのが遅れる)。印を見たら True。"""
+    end = time.monotonic() + seconds
+    while not block_flag_seen(path, started):
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(step, left))
+    return True
 
 
 def lane_plan(lane, every=None, before=None, after=None, min_before=None):
@@ -101,7 +170,9 @@ def main():
     ap.add_argument("--start", type=int, default=9 * 60 + 30, help="この時刻(JST 分)より前に起動したら何もしない")
     ap.add_argument("--max-run-seconds", type=int, default=MAX_RUN_SECONDS,
                     help="収集を正常終了する実行秒数(最大20700秒)。次の既存ジョブへ引き継ぐ")
+    ap.add_argument("--block-flag", default=BLOCK_FLAG, help="走行機ごと弾かれたときに置く印(車線の間で共有)")
     a = ap.parse_args()
+    started = time.time()
     if not 0 < a.max_run_seconds <= MAX_RUN_SECONDS:
         ap.error("--max-run-seconds must be between 1 and 20700")
     plan = lane_plan(a.lane, a.every, a.before, a.after, a.min_before)
@@ -121,18 +192,23 @@ def main():
           f"{plan['after']} 分後{note}・{'/'.join(plan['scripts'])}"
           f"・おまけ {'あり' if plan['extras'] else 'なし'}", flush=True)
     n = 0
+    watch = BlockWatch()
     deadline = time.monotonic() + a.max_run_seconds
     while True:
         now = dt.datetime.now(JST)
         if time.monotonic() >= deadline:
             print(f"[{now:%H:%M:%S}] 収集の実行上限前に正常終了。保存後、次の既存ジョブへ引継ぎ", flush=True)
             return 0
+        if block_flag_seen(a.block_flag, started):
+            print(f"[{now:%H:%M:%S}] ほかの車線が「走行機ごと弾かれた」と判断= 抜けて次の便に渡す(車線 {a.lane})", flush=True)
+            return BLOCK_EXIT
         if now.hour * 60 + now.minute >= until:
             print(f"[{now:%H:%M:%S}] {a.until} を過ぎたので終了(車線 {a.lane}・周回 {n})", flush=True)
             return 0
         t0 = time.time()
         n += 1
         print(f"===== {a.lane} 周回 {n} {now:%H:%M:%S} =====", flush=True)
+        rcs = []
         for script in plan["scripts"]:
             cmd = odds_cmd(script, plan)
             if n == 1 and script == "odds_full.py":
@@ -141,8 +217,20 @@ def main():
             if rc is None:
                 print("収集の実行枠が終了。成果物保存のため正常終了", flush=True)
                 return 0
+            rcs.append(rc)
             if rc:
                 print(f"  {script} rc={rc}(次の周で取り直す)", flush=True)
+        if watch.feed(rcs, time.monotonic()):
+            why = probe()
+            if why is None:
+                print(f"  取得の全失敗が {BLOCK_AFTER} 秒続いたが、レース一覧は取れる= 走行機は弾かれていない(数え直す)",
+                      flush=True)
+                watch.reset()
+            else:
+                Path(a.block_flag).write_text(f"{dt.datetime.now(JST):%H:%M:%S} {a.lane} {why}\n", encoding="utf-8")
+                print(f"[{dt.datetime.now(JST):%H:%M:%S}] 取得の全失敗が {BLOCK_AFTER} 秒続き、レース一覧も取れない"
+                      f"({why})= 走行機ごと弾かれた。抜けて次の便(別の走行機)に渡す", flush=True)
+                return BLOCK_EXIT
         # 間引いて回すもの(落ちても次の周に任せる= オッズ本体は止めない)
         for cmd in extra_cmds(plan, n):
             rc = bounded_child(cmd, env, deadline)
@@ -152,8 +240,10 @@ def main():
             if rc:
                 print(f"  {cmd[0]} rc={rc}(次の周で取り直す)", flush=True)
         wait = min(plan["every"] - (time.time() - t0), deadline - time.monotonic())
-        if wait > 0:
-            time.sleep(wait)
+        if wait > 0 and nap(wait, a.block_flag, started):
+            print(f"[{dt.datetime.now(JST):%H:%M:%S}] ほかの車線が「走行機ごと弾かれた」と判断= 抜けて次の便に渡す"
+                  f"(車線 {a.lane})", flush=True)
+            return BLOCK_EXIT
 
 
 if __name__ == "__main__":

@@ -29,6 +29,9 @@ UA = os.environ.get("COLLECTOR_UA") or "odds-collector/1.0"
 # 2 本並べて回すとき、どちらの行かログで分かるようにする目印。空なら今までと同じ書き方。
 TAG = os.environ.get("COLLECTOR_TAG") or ""
 TIMEOUT = 20
+# 取りに行った全部が通信の失敗だった回の rc(監査 #19 の「本当の失敗」)。⛔投入失敗の 1 と分ける=
+# loop.py はこれが続く走行機を「keiba.go.jp に弾かれた」と見て別の走行機へ渡す(2026-09-23 夜の 404)
+FETCH_BLOCKED = 3
 
 # 公式表記の場名 → k_babaCode
 BABA = {
@@ -697,7 +700,7 @@ def main():
         return 0
     if not rows:
         # 監査 #19 取りに行った全ページが通信の失敗(発売前・場に無い・検算落ちが 1 つも無い)= 本当の失敗
-        return 1 if all_failed(tot) else 0
+        return FETCH_BLOCKED if all_failed(tot) else 0
     status, msg = upsert(url, key, TABLE, CONFLICT, rows)
     if status >= 300 or status == 0:
         log(f"投入失敗 status={status} {msg}")

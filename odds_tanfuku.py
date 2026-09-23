@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.parse
 
-from odds_full import (BABA, JST, MIN_BEFORE_OFF, http_get, load_env, log, now_minute, out_of_lane,
+from odds_full import (BABA, FETCH_BLOCKED, JST, MIN_BEFORE_OFF, http_get, load_env, log, now_minute, out_of_lane,
                        post_minutes, sb_get, upsert, _num, _text)
 
 ODDS_URL = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/OddsTanFuku"
@@ -266,7 +266,7 @@ def main():
         return 0
     if not rows:
         # 監査 #19 取りに行った全部が通信の失敗(発売前・表なしが 1 つも無い)= 本当の失敗。正常な空は 0 のまま
-        return 1 if all_failed(ok, ng, empty) else 0
+        return FETCH_BLOCKED if all_failed(ok, ng, empty) else 0
     status, msg = upsert(url, key, TABLE, CONFLICT, rows)
     if status >= 300 or status == 0:
         log(f"投入失敗 status={status} {msg}")

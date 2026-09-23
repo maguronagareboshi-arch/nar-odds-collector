@@ -1,0 +1,63 @@
+# 救助係: 走行中の collect が固まったら外から取り消し、次の便(別の走行機)に継がせる(2026-09-23 夜の教訓)。
+# collect は concurrency で 1 本ずつ= 走行中の便が固まると、見張りが起こし直しても後ろに積まれるだけだった。
+# 起こすのは本番 DB の見張り(pg_cron nar-odds-watchdog)= 窓が開いて 10 分たつのに 2 分刻みが 10 分書かれないとき。
+# ここは collect の列の外で走り、①全券種(nar_odds_full)が今日 10 分以上書かれていない ②起動から 10 分以上
+# の両方を満たす collect だけを強制的に取り消す。⛔DB が読めないときは何もしない(DB 側の障害は走行機を替えても直らない)。
+# SQL(見張り)= sql/odds_watchdog_rescue_20260923.sql
+name: rescue
+on:
+  workflow_dispatch:
+concurrency:
+  group: rescue
+  cancel-in-progress: false
+permissions:
+  actions: write
+  contents: read
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: force-cancel a stalled collect run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          STALE_MIN: '10'
+        run: |
+          today=$(TZ=Asia/Tokyo date +%F)
+          now=$(date -u +%s)
+          if ! body=$(curl -sf --max-time 20 \
+              "${SUPABASE_URL%/}/rest/v1/nar_odds_full?select=observed_at&race_date=eq.$today&order=observed_at.desc&limit=1" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"); then
+            echo "::warning::DB が読めない= 何もしない(走行機を替えても直らない)"
+            exit 0
+          fi
+          last=$(echo "$body" | jq -r '.[0].observed_at // empty')
+          if [ -n "$last" ]; then
+            age=$(( (now - $(date -u -d "$last" +%s)) / 60 ))
+            echo "全券種の最後の書き込み $last(${age} 分前)"
+            if [ "$age" -lt "$STALE_MIN" ]; then echo "書けている= 何もしない"; exit 0; fi
+          else
+            echo "今日の全券種は 0 行"
+          fi
+          done_any=""
+          for id in $(gh run list -R "$REPO" -w collect.yml -s in_progress --json databaseId -q '.[].databaseId'); do
+            started=$(gh api "repos/$REPO/actions/runs/$id/jobs" -q '[.jobs[].started_at | select(. != null)] | min // empty')
+            if [ -z "$started" ]; then echo "run $id はまだジョブが始まっていない"; continue; fi
+            run_age=$(( (now - $(date -u -d "$started" +%s)) / 60 ))
+            if [ "$run_age" -lt "$STALE_MIN" ]; then
+              echo "run $id は起動 ${run_age} 分= 立ち上がり中なので待つ"
+              continue
+            fi
+            echo "::warning::collect run $id は ${run_age} 分走っているのに全券種が書けていない= 強制取り消し"
+            gh api -X POST "repos/$REPO/actions/runs/$id/force-cancel" >/dev/null
+            done_any=1
+          done
+          if [ -n "$done_any" ]; then
+            # 継ぐ便を 1 本積む(見張りの起こした便が既に積まれていれば置き換わるだけ)
+            gh workflow run collect.yml -R "$REPO" --ref "${{ github.event.repository.default_branch }}"
+          else
+            echo "取り消す collect は無い"
+          fi
