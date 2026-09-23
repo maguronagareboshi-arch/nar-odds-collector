@@ -588,6 +588,12 @@ def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
 
 # ---------------------------------------------------------------- 本体
 
+def all_failed(tot):
+    """監査 #19 1 券種も取れず、通信の失敗だけがあった(発売前などの正常な空は含まない)。"""
+    return (tot.get("ok", 0) == 0 and tot.get("ng", 0) > 0
+            and not any(tot.get(k, 0) for k in ("empty", "absent", "reject")))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="取得・解析だけして投入しない")
@@ -690,7 +696,8 @@ def main():
         log("dry-run: 投入しない")
         return 0
     if not rows:
-        return 0
+        # 監査 #19 取りに行った全ページが通信の失敗(発売前・場に無い・検算落ちが 1 つも無い)= 本当の失敗
+        return 1 if all_failed(tot) else 0
     status, msg = upsert(url, key, TABLE, CONFLICT, rows)
     if status >= 300 or status == 0:
         log(f"投入失敗 status={status} {msg}")

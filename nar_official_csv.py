@@ -389,6 +389,33 @@ def race_cancel_marks(payback_rows: Iterable[dict[str, str]],
     return marks
 
 
+class ArchiveColumnsError(RuntimeError):
+    """監査 #19: 公式 CSV の見出しから必須の列が消えた/名前が変わった。⛔ValueError にしない
+    (取り込み側は ValueError を「ZIP でない= 開催なし」として rc 0 で流すため)。"""
+
+
+# 監査 #19: これが無いと結果・出馬表が黙って空(None)になる列。⛔行が 0 のファイルは見ない(見出しが読めない)
+REQUIRED_COLUMNS = {
+    "_racelist.csv": ("競馬場", "競走年月日", "レース番号", "発走時刻", "距離"),
+    "_horselist.csv": ("競馬場", "競走年月日", "レース番号", "馬番", "馬名", "着順", "人気", "生年月日"),
+    "_payback.csv": ("単勝組番", "単勝払戻金（円）"),
+}
+
+
+def check_columns(files: dict[str, list[dict[str, str]]]) -> None:
+    """必須の列が欠けたファイルがあれば ArchiveColumnsError。"""
+    lost = []
+    for name, rows in files.items():
+        for suffix, need in REQUIRED_COLUMNS.items():
+            if name.endswith(suffix) and rows:
+                head = set(rows[0].keys())
+                miss = [c for c in need if c not in head]
+                if miss:
+                    lost.append(f"{name}: {','.join(miss)}")
+    if lost:
+        raise ArchiveColumnsError("NAR CSV の必須の列が無い(列名が変わった?) " + " / ".join(lost))
+
+
 def normalize_archive(payload: bytes, *, kind: str, scope: str,
                       source_url: str, observed_at: str) -> dict[str, Any]:
     source_hash = digest_bytes(payload)
@@ -403,6 +430,7 @@ def normalize_archive(payload: bytes, *, kind: str, scope: str,
         "files": sorted(files),
     }
     if kind == "race":
+        check_columns(files)
         race_rows = next((rows for name, rows in files.items() if name.endswith("_racelist.csv")), [])
         horse_rows = next((rows for name, rows in files.items() if name.endswith("_horselist.csv")), [])
         payout_rows = next((rows for name, rows in files.items() if name.endswith("_payback.csv")), [])

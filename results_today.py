@@ -24,7 +24,7 @@ from pathlib import Path
 
 import urllib.request
 
-from nar_official_csv import UA, digest_bytes, download_url, normalize_archive
+from nar_official_csv import UA, ArchiveColumnsError, digest_bytes, download_url, normalize_archive
 from load_nar_official import build_dedup, load_env, upsert_all
 
 JST = dt.timezone(dt.timedelta(hours=9))
@@ -94,6 +94,8 @@ def main():
         received_at = dt.datetime.now(dt.timezone.utc).isoformat()
         doc = normalize_archive(payload, kind="race", scope="daily", source_url=final,
                                 observed_at=dt.datetime.now(dt.timezone.utc).isoformat())
+    except ArchiveColumnsError as e:              # 監査 #19 公式 CSV の列名が変わった= 本当の失敗
+        log(f"⛔{e}"); return 1
     except ValueError as e:                       # ZIP でない応答= 開催なし or エラーページ
         log(f"公式が ZIP を返さない({str(e)[:80]})"); return 0
     except Exception as e:

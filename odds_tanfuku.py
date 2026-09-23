@@ -167,6 +167,11 @@ def pick_targets(races, finals, now_min, before, after, limit, min_before=MIN_BE
     return out[:limit]
 
 
+def all_failed(ok, ng, empty):
+    """監査 #19 取得が 1 件も成功せず、失敗だけがあった(発売前・表なしの正常な空は含まない)。"""
+    return ok == 0 and ng > 0 and empty == 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -260,7 +265,8 @@ def main():
         log("dry-run: 投入しない")
         return 0
     if not rows:
-        return 0
+        # 監査 #19 取りに行った全部が通信の失敗(発売前・表なしが 1 つも無い)= 本当の失敗。正常な空は 0 のまま
+        return 1 if all_failed(ok, ng, empty) else 0
     status, msg = upsert(url, key, TABLE, CONFLICT, rows)
     if status >= 300 or status == 0:
         log(f"投入失敗 status={status} {msg}")
