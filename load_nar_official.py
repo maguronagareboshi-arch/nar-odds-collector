@@ -384,9 +384,79 @@ def by_columns(rows):
     return sorted(groups.values(), key=lambda g: -len(g))
 
 
+# 監査 #4(8/23 と同型の守り): DB に結果が入っている走/レースを、結果の無い行(出馬表だけの月次 ZIP 等)の null で
+# 上書きしない。build_dedup の守りは 1 回の実行内だけなので、送る前に DB を読んで「新しい値が null の結果列」を外す。
+# ⛔DB トリガは作らない。⛔列を外すだけ= 行そのものは送る(出馬表側の更新は通す)
+RUN_RESULT_COLS = ("finish", "finish_note", "time_raw", "time_sec", "margin", "last3f", "popularity")
+RACE_RESULT_COLS = ("race_last4f", "race_last3f", "furlongs", "corners", "weather", "going")
+
+
+def _empty(v):
+    return v is None or v == [] or v == ""
+
+
+def db_result_keys(url, key, dates, log=print, page=1000):
+    """DB で結果の入っている走の鍵 {(場,日,R,馬番)}。日ごとに読む(offset の order は一意の鍵 4 列)。"""
+    got = set()
+    for d in sorted(dates):
+        off = 0
+        while True:
+            q = (f"{url}/rest/v1/nar_runs?select=track,race_date,race_no,runner_number&race_date=eq.{d}"
+                 "&or=(finish.not.is.null,time_raw.not.is.null,finish_note.not.is.null)"
+                 f"&order=track.asc,race_no.asc,runner_number.asc&limit={page}&offset={off}")
+            req = urllib.request.Request(q, headers={"apikey": key, "Authorization": f"Bearer {key}",
+                                                     "User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                rows = json.loads(r.read().decode("utf-8"))
+            for x in rows:
+                got.add((x.get("track"), x.get("race_date"), to_int(x.get("race_no")), to_int(x.get("runner_number"))))
+            if len(rows) < page:
+                break
+            off += page
+    return got
+
+
+def protect_db_results(dedup, have):
+    """have= DB で結果ありの走の鍵。結果なしの行から「新しい値が空の結果列」を外す。戻り値= (外した走, 外したレース)"""
+    n_run = n_race = 0
+    race_keys = {k[:3] for k in have}
+    for k, row in dedup.get("runs", {}).items():
+        if k in have and not has_result(row):
+            for c in RUN_RESULT_COLS:
+                if c in row and _empty(row[c]):
+                    del row[c]
+            n_run += 1
+    for k, row in dedup.get("races", {}).items():
+        if k in race_keys:
+            drop = [c for c in RACE_RESULT_COLS if c in row and _empty(row[c])]
+            for c in drop:
+                del row[c]
+            n_race += 1 if drop else 0
+    return n_run, n_race
+
+
+def guard_before_upsert(url, key, dedup, log=print, fetch=None):
+    """結果の無い走が今日以前の日にあるときだけ DB を読む(先の日の出馬表は読まない= 軽い)。"""
+    today = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date().isoformat()
+    dates = {k[1] for k, row in dedup.get("runs", {}).items()
+             if k[1] and k[1] <= today and not has_result(row)}
+    if not dates:
+        return 0, 0
+    have = (fetch or db_result_keys)(url, key, dates, log=log)
+    n_run, n_race = protect_db_results(dedup, have)
+    if n_run or n_race:
+        log(f"  (監査 #4 DB の結果を null で上書きしない: 走 {n_run:,} 行・レース {n_race:,} 行の結果列を送らない)")
+    return n_run, n_race
+
+
 def upsert_all(url, key, dedup, batch=BATCH, only=None, log=print):
     """3表を順に upsert。成功 0 / 失敗 1(失敗した表で止まる。何度流しても同じ結果)。"""
     batch = max(50, int(batch or BATCH))
+    if only in (None, "runs", "races"):
+        try:
+            guard_before_upsert(url, key, dedup, log=log)
+        except Exception as e:                  # 読めないまま送ると上書きしうる= 止める(次回取り直す)
+            log(f"  監査 #4 DB の結果の下読みに失敗= 投入しない: {type(e).__name__}: {str(e)[:160]}"); return 1
     for k in TABLES:
         if only and only != k:
             continue
