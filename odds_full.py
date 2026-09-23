@@ -423,7 +423,8 @@ def synth_first(got):
     """その馬が 1 着の組を全部同じ額で買ったときの倍率= 1 / Σ(1/オッズ)。{馬番: 小数1桁}。
     got= parse_ranking の行 [(nums, odds, rank)]。オッズ 0 以下・数でないものは足さない(発売の無い組)。"""
     acc = {}
-    for nums, odds, _rank in got:
+    for row in got:                                     # §245 ワイドは 4 つ(上限つき)= 先頭 2 つだけ使う
+        nums, odds = row[0], row[1]
         try:
             o = float(odds)
         except (TypeError, ValueError):
@@ -571,7 +572,7 @@ def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
         st["final"] += 1 if is_final else 0
         scratched = "" if m == head else f"・取消 {head - m} 頭とみなす"
         log(f"    {KIND_LABEL[kind]} {len(got)}組 = {m}頭の全通り{scratched}"
-            f"{' (最終)' if is_final else ''} 先頭3組 {[(list(a), o, r) for a, o, r in got[:3]]}")
+            f"{' (最終)' if is_final else ''} 先頭3組 {[(list(x[0]), x[1], x[2]) + tuple(x[3:]) for x in got[:3]]}")
         row, tick = rows_for_kind(target, date, kind, got, is_final, dt.datetime.now(dt.timezone.utc).isoformat(), prev_h, prev_final)
         rows.append(row)
         if tick is None:
