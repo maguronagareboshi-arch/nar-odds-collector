@@ -1,0 +1,38 @@
+# 取り逃した最終オッズ(単複・全券種)を当日のうちに取り直す。⛔公式は当日分しか返さない= 日付が変わると取れない。
+# 対象= 発走から 10 分〜max_after 分たったレースのうち、最終オッズがまだ入っていないものだけ
+# (最終済みは各スクリプトが飛ばす・発走 10 分後までは collect の車線に任せる)。
+# 使いどころ= collect が止まっていた後(2026-09-23 16:00〜17:28 に 10 レースの最終が欠けた)。
+name: refetch-final
+on:
+  workflow_dispatch:
+    inputs:
+      max_after:
+        description: '発走から何分前のレースまで遡るか(分)'
+        required: false
+        default: '720'
+concurrency:
+  group: refetch-final
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  refetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: refetch final odds of past races
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          COLLECTOR_UA: ${{ secrets.COLLECTOR_UA }}
+          MAX_AFTER: ${{ github.event.inputs.max_after || '720' }}
+        run: |
+          # 片方が落ちても、もう片方は取る(当日を過ぎると取り直せない)
+          rc=0
+          python odds_tanfuku.py --before -10 --after "$MAX_AFTER" --limit 80 || rc=$?
+          python odds_full.py --before -10 --after "$MAX_AFTER" --limit 80 || rc=$?
+          exit "$rc"
