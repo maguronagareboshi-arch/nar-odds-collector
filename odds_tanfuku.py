@@ -279,6 +279,9 @@ def main():
             log(f"⚠{TICKS} の追記に失敗 status={st2} {msg2}")
         else:
             log(f"追記 {len(ticks)} 行 -> {TICKS}")
+            # 監査 A8(2026-09-24) 刻みを入れた周だけ最終成功時刻を書く(表が無くても落ちない・5 秒で諦める)
+            from heartbeat import beat
+            beat(url, key, "odds_tanfuku", note=f"{len(ticks)} 行")
     return 0
 
 

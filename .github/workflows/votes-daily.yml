@@ -31,7 +31,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: "collect yesterday votes - 1 page per second"
+      # 監査 A9(2026-09-24) 前日 1 日だけだと、着火が落ちた/失敗した日が回収されない= 直近 7 日(昨日〜7 日前)のうち
+      #   票数(nar_race_votes)の行が公式のレース数(nar_races・取り止め除く)より少ない日を全部拾う(古い日から)。
+      #   date を指定した手押しはその 1 日だけ(従来どおり)。DB が読めない日は昨日だけ。1 日ずつ既存の --date を回す
+      - name: "collect votes of missing days in the last 7 days - 1 page per second"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -40,8 +43,48 @@ jobs:
           DATE: ${{ github.event.inputs.date }}
           DRY: ${{ github.event.inputs.dry }}
         run: |
-          D="$DATE"
-          if [ -z "$D" ]; then D=$(TZ=Asia/Tokyo date -d yesterday +%F); fi
-          args="--date $D --votes-only --max-seconds 1200"
-          if [ "$DRY" = "true" ]; then args="$args --dry"; fi
-          python rakuten_backfill.py $args
+          if [ -n "$DATE" ]; then
+            DAYS="$DATE"
+          else
+            DAYS=$(python - <<'PY'
+          import datetime as dt, json, os, urllib.request
+          JST = dt.timezone(dt.timedelta(hours=9))
+          today = dt.datetime.now(JST).date()
+          url, key = os.environ.get("SUPABASE_URL", "").rstrip("/"), os.environ.get("SUPABASE_SERVICE_KEY", "")
+          def count(path):
+              req = urllib.request.Request(f"{url}/rest/v1/{path}", method="HEAD",
+                  headers={"apikey": key, "Authorization": "Bearer " + key, "Prefer": "count=exact", "Range": "0-0"})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return int(r.headers.get("Content-Range", "*/0").split("/")[-1])
+          out = []
+          for back in range(7, 0, -1):
+              d = (today - dt.timedelta(days=back)).isoformat()
+              try:
+                  races = count(f"nar_races?select=race_no&race_date=eq.{d}&cancelled=is.null")
+                  votes = count(f"nar_race_votes?select=race_no&race_date=eq.{d}")
+              except Exception as e:
+                  import sys; print(f"::warning::{d} の数が読めない({type(e).__name__})= 昨日だけにする", file=sys.stderr)
+                  out = [(today - dt.timedelta(days=1)).isoformat()]; break
+              import sys; print(f"{d} レース {races} / 票数 {votes}", file=sys.stderr)
+              if races > 0 and votes < races:
+                  out.append(d)
+          print(" ".join(out))
+          PY
+            )
+          fi
+          echo "取る日= ${DAYS:-(無し)}"
+          rc=0
+          for D in $DAYS; do
+            args="--date $D --votes-only --max-seconds 1200"
+            if [ "$DRY" = "true" ]; then args="$args --dry"; fi
+            python rakuten_backfill.py $args || { echo "::warning::$D の票数が取れない"; rc=1; }
+          done
+          if [ "$rc" = 0 ] && [ "$DRY" != "true" ]; then python heartbeat.py votes ok "${DAYS:-未取得なし}"; fi
+          exit $rc
+      # 監査 A8(2026-09-24) 失敗の印(表が無くても落ちない)
+      - name: "heartbeat fail"
+        if: failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python heartbeat.py votes fail 失敗

@@ -142,6 +142,9 @@ def main():
         log("書き込み失敗(次の周で取り直す)"); return 1
     STATE.write_text(json.dumps(sig, ensure_ascii=False), encoding="utf-8")
     log(f"完了 {time.time() - t0:.1f}s")
+    # 監査 A8(2026-09-24) 書けたときだけ最終成功時刻を書く(表が無くても落ちない・5 秒で諦める)
+    from heartbeat import beat
+    beat(url, key, "results_today")
     return 0
 
 

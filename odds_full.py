@@ -714,6 +714,9 @@ def main():
         elif status >= 300 or status == 0:
             log(f"全点の投入失敗 status={status} {msg}")
             return 1
+    # 監査 A8(2026-09-24) 書けた周だけ最終成功時刻を書く(表が無くても落ちない・5 秒で諦める)
+    from heartbeat import beat
+    beat(url, key, "odds_full", note=f"{len(rows)} 行")
     # §123 同じ周回の 2 分刻みの行(odds_tanfuku.py が先に入れている)に 1着固定の合成を書き足す
     for t in targets:
         if t.get("synth"):
