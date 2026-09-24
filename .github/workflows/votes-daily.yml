@@ -34,6 +34,7 @@ jobs:
       # 監査 A9(2026-09-24) 前日 1 日だけだと、着火が落ちた/失敗した日が回収されない= 直近 7 日(昨日〜7 日前)のうち
       #   公式のレース(nar_races・取り止め除く)があるのに票数(nar_race_votes)の行が 0 の日(1 日まるごと取れていない日)を全部拾う(古い日から)。
       #   ⛔一部の場だけ無い日は取り直さない(取得元に無い場を毎日取り直さないため)。
+      #   ただし昨日だけは毎朝取り直す(2026-09-24 当日 22:40 の便を足したため・夜に一部しか出ていなかった場を埋める)。
       #   date を指定した手押しはその 1 日だけ(従来どおり)。DB が読めない日は昨日だけ。1 日ずつ既存の --date を回す
       - name: "collect votes of missing days in the last 7 days - 1 page per second"
         env:
@@ -67,7 +68,8 @@ jobs:
                   import sys; print(f"::warning::{d} の数が読めない({type(e).__name__})= 昨日だけにする", file=sys.stderr)
                   out = [(today - dt.timedelta(days=1)).isoformat()]; break
               import sys; print(f"{d} レース {races} / 票数 {votes}", file=sys.stderr)
-              if races > 0 and votes == 0:
+              # 昨日は行があっても毎朝取り直す(夜 22:40 の便が一部の場の前に取った日を埋める・upsert なので増えない)
+              if races > 0 and (votes == 0 or back == 1):
                   out.append(d)
           print(" ".join(out))
           PY
