@@ -11,7 +11,10 @@
 ⛔書くのは「結果の入ったレース」の行だけ(nar_races / nar_runs / nar_race_payouts)。出馬表だけのレースと
   馬テーブル(nar_horses)は本体の 20 分おきの便に任せる(同じ写し方なので競合しない・冪等)。
 ⛔取り止めのレースだけは例外で、着順が無くても **nar_races の 1 行だけ**書く(印を当日のうちに入れるため)。
-⛔ZIP のバイト列は毎回変わる(中にタイムスタンプ)ので、ハッシュでなく「結果の入ったレースの集合+払戻の行数」で前回と比べる。
+⛔ZIP のバイト列は毎回変わる(中にタイムスタンプ)ので、ZIP でなく「レースごとに書く行の中身のハッシュ」で前回と比べ、
+  中身が変わったレースだけ書く(2026-09-26 修正: 前は「結果の入ったレースの集合+払戻の行数」だけで比べていたため、
+  4 着以下の着順・タイム・着差・上りが後から載っても書き直さなかった。実例= 9/26 高知 3R)。
+  ハッシュから外す列= updated_at(毎回変わる)・source_snapshot_hash(ZIP ごとに変わる)。
 終了コード: 0 正常(取得できない・開催なしも 0= 次の周に任せる)/ 1 書き込み失敗
 """
 import argparse
@@ -64,6 +67,28 @@ def rows_to_write(dedup, fin, off):
         out[table] = {k: v for k, v in rows.items() if (k[0], int(k[2])) in want}
     out["horses"] = {}
     return out
+
+
+HASH_SKIP = ("updated_at", "source_snapshot_hash")
+
+
+def race_hashes(out):
+    """{"場|R": 中身のハッシュ}。out = rows_to_write の戻り値。races / runs / payouts の行を
+    レースごとにまとめ、毎回変わる列(HASH_SKIP)を除いて JSON にしてハッシュする。"""
+    import hashlib
+    per = {}
+    for table in ("races", "runs", "payouts"):
+        for k, row in sorted((out.get(table) or {}).items(), key=lambda kv: json.dumps(kv[0], ensure_ascii=False, default=str)):
+            rk = f"{k[0]}|{int(k[2])}"
+            per.setdefault(rk, []).append([table, {c: v for c, v in row.items() if c not in HASH_SKIP}])
+    return {rk: hashlib.sha1(json.dumps(v, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+            for rk, v in per.items()}
+
+
+def changed_races(hashes, prev_hashes):
+    """中身が前回と違うレースの鍵 {(場, R)}(前回に無いレースも含む)。"""
+    prev_hashes = prev_hashes or {}
+    return {(rk.rsplit("|", 1)[0], int(rk.rsplit("|", 1)[1])) for rk, h in hashes.items() if prev_hashes.get(rk) != h}
 
 
 def read_state():
@@ -120,21 +145,28 @@ def main():
     # ⛔ここを合図に入れないと「変化なし」で弾かれ、当日は印が入らない
     off = sorted({(r["track"], int(r["race_no"])) for r in races
                   if r.get("cancelled") and r.get("race_date") == today})
-    sig = {"date": today, "fin": [list(k) for k in fin], "pays": pays, "off": [list(k) for k in off]}
+    dedup, stats = build_dedup([(doc.get("source_observed_at") or "", "daily", doc)])
+    full = rows_to_write(dedup, fin, off)
+    hashes = race_hashes(full)
+    sig = {"date": today, "fin": [list(k) for k in fin], "pays": pays, "off": [list(k) for k in off], "h": hashes}
     prev = read_state()
-    if (not a.force and prev.get("date") == today and prev.get("fin") == sig["fin"]
-            and prev.get("pays") == pays and (prev.get("off") or []) == sig["off"]):
+    same_day = prev.get("date") == today
+    changed = set() if not same_day else changed_races(hashes, prev.get("h"))
+    if not a.force and same_day and not changed and prev.get("h") is not None:
         log(f"変化なし(結果あり {len(fin)}R・取り止め {len(off)}R・払戻 {pays} 行・{time.time() - t0:.1f}s)"); return 0
-    new = [k for k in fin if list(k) not in (prev.get("fin") or [])] if prev.get("date") == today else fin
-    log(f"取得 {digest_bytes(payload)[:8]} レース {len(races)}・結果あり {len(fin)}R(新着 {len(new)})・払戻 {pays} 行")
+    if a.force or not same_day or prev.get("h") is None:
+        changed = set(fin) | set(off)
+    new = [k for k in fin if list(k) not in (prev.get("fin") or [])] if same_day else fin
+    log(f"取得 {digest_bytes(payload)[:8]} レース {len(races)}・結果あり {len(fin)}R(新着 {len(new)}・中身の変化 {len(changed)}R)・払戻 {pays} 行")
     if not fin and not off:
         STATE.write_text(json.dumps(sig, ensure_ascii=False), encoding="utf-8"); return 0
 
-    dedup, stats = build_dedup([(doc.get("source_observed_at") or "", "daily", doc)])
-    out = rows_to_write(dedup, fin, off)
+    # 中身が変わったレースだけ書く(書き込み量を増やさない)
+    out = rows_to_write(dedup, [k for k in fin if k in changed], [k for k in off if k in changed])
     n = {t: len(v) for t, v in out.items()}
     log(f"書く行= races {n['races']} / runs {n['runs']} / payouts {n['payouts']}"
-        + (f"・取り止め {len(off)}" if off else "") + (f"・新着 {new}" if new else ""))
+        + (f"・取り止め {len(off)}" if off else "") + (f"・新着 {new}" if new else "")
+        + f"・変化 {sorted(changed)}")
     if a.dry_run:
         return 0
     rc = upsert_all(url, key, out, batch=1000, log=log)
