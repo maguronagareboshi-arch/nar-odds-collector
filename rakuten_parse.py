@@ -48,6 +48,15 @@ def text_ja(fragment):
     return re.sub(r" *　 *", "　", s).strip()
 
 
+def person(name):
+    """騎手・調教師名だけ: 「1 字+半角空白+1 字」なら全角空白に戻す(公式 2022-11 以降の「林　豊」の形・2026-10-03 監査)。
+    ⛔馬名・本文には使わない。"""
+    if not name:
+        return name
+    m = re.fullmatch(r"(\S) (\S)", name)
+    return f"{m.group(1)}　{m.group(2)}" if m else name
+
+
 def lines(fragment):
     """<br> とタグを改行にして、空でない行の列に。"""
     s = re.sub(r"<br\s*/?>", "\n", fragment or "", flags=re.I)
@@ -318,8 +327,8 @@ def parse_runs(page):
             "horse_id": hid.group(1) if hid else None,
             "sex": sexage.group(1) if sexage else None,
             "age": int(sexage.group(2)) if sexage else None,
-            "jockey": (jockey[0][jmark.end():] if jmark else jockey[0]) if jockey else None,
-            "trainer": text(cell.get("tamer", "")) or None,
+            "jockey": person(jockey[0][jmark.end():] if jmark else jockey[0]) if jockey else None,
+            "trainer": person(text(cell.get("tamer", ""))) or None,
             "carried_weight": to_num(wt),
             "weight_mark": mark.group(0) if mark else (jmark.group(0) if jmark else None),
             "body_weight": to_int(weight[0]) if weight else None,
