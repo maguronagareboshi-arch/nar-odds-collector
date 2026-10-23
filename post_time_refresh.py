@@ -6,7 +6,10 @@
 公式の一覧は直っているのに保存側が古いままだと、発走前後の窓で取るオッズも「あと何分」もその分ずれる。
 
 §137: 同じ一覧ページの上に出る取り止めの告知(section.earlyWarning)も、同じ 1 回の取得から
-nar_races.cancel_note に写す(⛔通信は増やさない・⛔印の cancelled 列はここでは書かない)。
+nar_races.cancel_note に写す(⛔通信は増やさない)。
+2026-10-23: 告知で取り止めと読めたレースには cancelled='notice'(公式の告知で取り止め・払戻は発表待ち)を付ける。
+  ⛔cancelled が空の行だけ= 公式 ZIP の印(refund/nosale)は上書きしない。ZIP の払戻が来ればそちらが正(走っていれば印は消える)。
+  実測 10/23 浦和 3R=「第3競走は、…取り止めとなりました」が旧判定(以降/開催だけ)で読めず、印は ZIP の 16:06 まで付かなかった。
 
   python post_time_refresh.py             # 今日(JST)の、当日レースのある場を全部
   python post_time_refresh.py --dry-run   # 取得と突合だけ(書き換えない)
@@ -38,9 +41,16 @@ TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 # <section class="earlyWarning"><div class="message">9/8（火）の笠松競馬第7競走以降は、…取り止めとなりました。</div></section>
 WARN_RE = re.compile(r'<section[^>]*class="[^"]*earlyWarning[^"]*"[^>]*>(.*?)</section>', re.S | re.I)
 MSG_RE = re.compile(r'<div[^>]*class="[^"]*message[^"]*"[^>]*>(.*?)</div>', re.S | re.I)
-FROM_RE = re.compile(r"第\s*(\d{1,2})\s*競走以降")
-CANCEL_WORDS = ("取り止め", "取りやめ", "取止め", "中止")      # この語が無い告知は取り止めではない
-WHOLE_WORDS = ("開催", "全競走", "全レース")                  # 「第N競走以降」が無いときだけ見る
+NOTICE_MARK = "notice"  # nar_races.cancelled の値= 公式の告知で取り止め(払戻は ZIP 待ち)
+# 取り止めと言い切る文だけ。⛔「中止」は開催ごと/言い切りの形だけ(理由の「第2競走の競走中止した馬」を拾わない)
+CANCEL_RE = re.compile(r"取り止め|取りやめ|取止め|開催を?中止|開催は中止|中止(?:します|とします|といたします|いたします|となりました|としました)")
+HEDGE_RE = re.compile(r"場合|可能性|予定|見込み|恐れ|おそれ|検討")   # 見込みの文は推定しない
+_JOIN = r"[、,，・]|及び|および|ならびに|並びに|と|から|より|～|〜|~|－|-"
+# 主語= 「第3競走は」「第7競走以降は」「第9競走から第12競走を」「第3・4競走は」。⛔「第2競走の…」は主語ではない
+SUBJ_RE = re.compile(r"(第\s*\d{1,2}\s*(?:競走|R)?(?:\s*(?:" + _JOIN + r")\s*(?:第\s*)?\d{1,2}\s*(?:競走|R)?)*)"
+                     r"\s*(以降|以後)?\s*(?:の競走|の各競走|の全競走)?\s*(?:は|を|につき|について)")
+RANGE_JOIN = re.compile(r"から|より|～|〜|~|－|-")
+WHOLE_RE = re.compile(r"開催|全競走|全レース|本日の競走")
 
 
 def list_url(date, baba):
@@ -87,54 +97,85 @@ def warning_text(page):
     m = WARN_RE.search(page)
     if not m:
         return None
-    d = MSG_RE.search(m.group(1))
-    return _text(d.group(1) if d else m.group(1)) or None
+    # 10/23 告知が 2 件以上並ぶ日もある= div.message を全部つなぐ(最初の 1 件だけだと 2 件目の取り止めを落とす)
+    ds = [_text(x) for x in MSG_RE.findall(m.group(1))]
+    return " ".join(x for x in ds if x) or _text(m.group(1)) or None
+
+
+def _subject_nos(span, after):
+    """主語の字列 → レース番号の集合と「以降」かどうか。範囲(から/～)は間を埋める。"""
+    nums = [int(n) for n in re.findall(r"\d{1,2}", span)]
+    joins = re.split(r"\d{1,2}", span)[1:-1]          # 数と数の間の字
+    out = set(nums)
+    for i, j in enumerate(joins):
+        if RANGE_JOIN.search(j):
+            out.update(range(nums[i], nums[i + 1] + 1))
+    return out, bool(after)
+
+
+def cancel_races(text, nos):
+    """告知文 → 取り止めのレース番号(昇順・nos の中だけ)。取り止めの告知でなければ []。
+
+    ⛔文(。区切り)ごとに見る。言い切りの「取り止め」があり、見込みの語(場合・予定など)が無い文だけ。
+    ⛔主語(第N競走は/を)が読めればその番号・「以降」ならそこから最後まで。主語が無く開催ごとの話なら全部。
+      それ以外(番号も開催も読めない)は何も返さない= 推定しない。
+    """
+    nos = sorted({int(n) for n in (nos or [])})
+    if not text or not nos:
+        return []
+    hit = set()
+    for sent in re.split(r"[。\n]", str(text)):
+        if not CANCEL_RE.search(sent) or HEDGE_RE.search(sent):
+            continue
+        subj = SUBJ_RE.findall(sent)
+        if subj:
+            for span, after in subj:
+                got, onward = _subject_nos(span, after)
+                if onward:
+                    got = {n for n in nos if n >= min(got)}
+                hit |= got
+        elif WHOLE_RE.search(sent):
+            hit |= set(nos)
+    return [n for n in nos if n in hit]
 
 
 def cancel_from(text):
-    """告知文 → 何レース目から取り止めか(全部なら 1)。取り止めの告知でなければ None。
-
-    ⛔「取り止め・中止」の語が無い文(発走時刻の変更など)には何も書かない= 推定しない。
-    ⛔「第N競走以降」が読めればそこから・読めなくて開催そのものの話なら全部。それ以外は書かない。
-    """
-    if not text or not any(word in text for word in CANCEL_WORDS):
-        return None
-    m = FROM_RE.search(text)
-    if m:
-        return int(m.group(1))
-    return 1 if any(word in text for word in WHOLE_WORDS) else None
+    """旧の口(試験と互換)= 取り止めの最初のレース番号(全部なら 1)・無ければ None。1〜12R として読む。"""
+    got = cancel_races(text, range(1, 13))
+    return got[0] if got else None
 
 
 def write_cancel_note(url, key, date, track, page, saved_notes, dry_run):
-    """§137 取り止めの告知文を nar_races.cancel_note に写す(同じ場・同じ日・第N競走以降)。
+    """§137 取り止めの告知文を nar_races.cancel_note に写し、そのレースに印 notice を付ける(10/23)。
 
-    ⛔印(cancelled 列)はここでは書かない= 印の出どころは公式 ZIP 1 つに保つ。
-    ⛔同じ文が既に入っていれば PATCH しない(10 分ごとの便で書き直さない)。
+    ⛔印は cancelled が空の行だけ(cancelled=is.null で絞る)= ZIP の refund/nosale を上書きしない。
+    ⛔同じ文が既に入っていれば告知文は PATCH しない(印の PATCH は空の行が無ければ 0 行で終わる)。
     戻り= 0 正常 / 1 書き込み失敗(呼び手の rc に混ぜる)。
     """
     text = warning_text(page)
     if not text:
         return 0
-    first = cancel_from(text)
-    if first is None:
-        log(f"  {track}: 告知はあるが取り止めの文ではない= 何も書かない({text[:60]})")
-        return 0
-    targets = [no for no in saved_notes if no >= first]
+    targets = cancel_races(text, saved_notes.keys())
     if not targets:
-        log(f"  ⚠{track}: 取り止めの告知({first}R 以降)だが保存側にその番号が無い= 触らない")
+        log(f"  {track}: 告知はあるが取り止めのレースが読めない= 何も書かない({text[:60]})")
         return 0
-    if all(saved_notes.get(no) == text for no in targets):
-        return 0
-    log(f"  {track}: 取り止めの告知を {first}R 以降 {len(targets)} 行へ({text[:60]})")
     if dry_run:
+        log(f"  {track}: 取り止めの告知 {targets} (dry-run)({text[:60]})")
         return 0
-    st, msg = patch(url, key, TABLE, [("race_date", f"eq.{date.isoformat()}"),
-                                      ("track", f"eq.{track}"), ("race_no", f"gte.{first}")],
-                    {"cancel_note": text})
+    base = [("race_date", f"eq.{date.isoformat()}"), ("track", f"eq.{track}"),
+            ("race_no", "in.(" + ",".join(str(n) for n in targets) + ")")]
+    rc = 0
+    if not all(saved_notes.get(no) == text for no in targets):
+        log(f"  {track}: 取り止めの告知を {targets} へ({text[:60]})")
+        st, msg = patch(url, key, TABLE, base, {"cancel_note": text})
+        if st >= 300 or st == 0:
+            log(f"    告知の書き込み失敗 status={st} {msg}")
+            rc = 1
+    st, msg = patch(url, key, TABLE, base + [("cancelled", "is.null")], {"cancelled": NOTICE_MARK})
     if st >= 300 or st == 0:
-        log(f"    告知の書き込み失敗 status={st} {msg}")
-        return 1
-    return 0
+        log(f"    印の書き込み失敗 status={st} {msg}")
+        rc = 1
+    return rc
 
 
 def patch(url, key, table, filters, body):

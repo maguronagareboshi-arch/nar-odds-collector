@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nar_official_csv import race_cancel_marks                       # noqa: E402
-from post_time_refresh import cancel_from, parse_list, warning_text  # noqa: E402
+from post_time_refresh import cancel_from, cancel_races, parse_list, warning_text  # noqa: E402
 from results_today import rows_to_write                              # noqa: E402
 
 TRACK = "笠松"
@@ -148,3 +148,37 @@ class TestRowsToWrite(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCancelRaces(unittest.TestCase):
+    """10/23 告知から取り止めのレース番号を読む(1 レース・複数・範囲・以降・開催ごと)"""
+    NOS = range(1, 13)
+
+    def test_real_page_urawa_20261023(self):
+        """実物= 10/23 浦和「第3競走は、第2競走の競走中止した馬…取り止めとなりました」→ 3R だけ(2R は理由の字)"""
+        page = (Path(__file__).resolve().parent / "fixtures" / "racelist_urawa_20261023.html").read_text(encoding="utf-8")
+        self.assertEqual(cancel_races(warning_text(page), self.NOS), [3])
+
+    def test_shapes(self):
+        c = lambda t: cancel_races(t, self.NOS)
+        self.assertEqual(c("10/23（金）の浦和競馬第3競走は、第2競走の競走中止した馬および騎手の収容に時間を要したため取り止めとなりました。"), [3])
+        self.assertEqual(c("9/8（火）の笠松競馬第7競走以降は、天候不良のため取り止めとなりました。"), list(range(7, 13)))
+        self.assertEqual(c("第3競走及び第4競走は取り止めとなりました。"), [3, 4])
+        self.assertEqual(c("第3・4競走は取り止めとします。"), [3, 4])
+        self.assertEqual(c("第9競走から第11競走を取り止めといたします。"), [9, 10, 11])
+        self.assertEqual(c("本日の笠松競馬は、降雨のため開催を中止します。"), list(range(1, 13)))
+        self.assertEqual(c("9/8（火）の全競走を取り止めます。"), list(range(1, 13)))
+
+    def test_not_cancel(self):
+        c = lambda t: cancel_races(t, self.NOS)
+        self.assertEqual(c("本日の第7競走以降の発走時刻を10分繰り下げます。"), [])
+        self.assertEqual(c("天候により第8競走以降は取り止めとなる場合があります。"), [])
+        self.assertEqual(c("第2競走で競走中止した馬がいます。"), [])
+        self.assertEqual(c("取り止めとなりました。"), [])          # 番号も開催も読めない= 推定しない
+        self.assertEqual(c(""), [])
+        self.assertEqual(c(None), [])
+
+    def test_only_saved_numbers(self):
+        """保存側に無い番号は返さない(以降は保存側の最後まで)"""
+        self.assertEqual(cancel_races("第7競走以降は取り止めとなりました。", [1, 2, 7, 8]), [7, 8])
+        self.assertEqual(cancel_races("第13競走は取り止めとなりました。", [1, 2, 3]), [])
