@@ -493,7 +493,7 @@ def save_page(save_dir, path, page):
     p.write_text(page, encoding="utf-8")
 
 
-def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
+def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None, pages=None):
     """1レースの6ページを取り、券種ごとの行にする。→ (rows, stats, 頭数, 合成, 全点)。
 
     rows= nar_odds_full の upsert 用(最新1行)・ticks= nar_odds_full_ticks の insert 用(中身が変わった券種だけ)。
@@ -514,7 +514,8 @@ def fetch_race(date, target, save_dir=None, prev_h=None, prev_final=None):
                       .decode("utf-8", "replace"))
         except Exception as e:
             log(f"    見本の取得失敗 OddsTanFuku: {type(e).__name__}: {str(e)[:120]}")
-    for pi, (path, kinds) in enumerate(PAGES):
+    # pages= 取るページの絞り(odds_w5.py は 3連単・馬単だけ)。⛔既定 None= 今までどおり 6 ページ全部
+    for pi, (path, kinds) in enumerate(pages or PAGES):
         if pi:
             time.sleep(SLEEP)
         url = page_url(path, date, target["race_no"], target["baba"])

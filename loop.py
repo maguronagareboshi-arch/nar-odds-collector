@@ -43,6 +43,8 @@ LANES = {
     "far": (120, 40, 8, 10, True),
     "hot": (60, 10, 8, None, False),
     "morning": (1800, 600, 0, 40, False),
+    # 2026-11-22 5重勝の対象 5 レースの 3連単・馬単を 1 本目の発走 45〜25 分前に(窓の判定は odds_w5.py)
+    "w5": (600, 45, 0, None, False),
 }
 LIMIT = 40          # 1 回の実行で取るレース数の上限(窓に入るのは多くて 6 前後)
 # 朝の車線だけは窓が広く、当日の未発走レースがほぼ全部入る(3〜4 場 × 12 レース)。40 では足りないので増やす。
@@ -50,6 +52,8 @@ LANE_LIMIT = {"morning": 60}
 # 全券種(3 連単まで)を回さない車線。⛔朝は単複だけ= 重い表の行数と HTTP を増やさない(§234)。
 TANFUKU_ONLY = {"morning"}
 ODDS_SCRIPTS = ("odds_tanfuku.py", "odds_full.py")
+# 自前の台本だけを回す車線(5重勝の組だけ)
+LANE_SCRIPTS = {"w5": ("odds_w5.py",)}
 
 MAX_RUN_SECONDS = 345 * 60  # Leave 15 minutes before GitHub's six-hour hard stop.
 
@@ -133,7 +137,7 @@ def lane_plan(lane, every=None, before=None, after=None, min_before=None):
             "min_before": mb if min_before is None else min_before,
             "extras": extras,
             "limit": LANE_LIMIT.get(lane, LIMIT),
-            "scripts": ("odds_tanfuku.py",) if lane in TANFUKU_ONLY else ODDS_SCRIPTS}
+            "scripts": LANE_SCRIPTS.get(lane) or (("odds_tanfuku.py",) if lane in TANFUKU_ONLY else ODDS_SCRIPTS)}
 
 
 def odds_cmd(script, plan, limit=None):

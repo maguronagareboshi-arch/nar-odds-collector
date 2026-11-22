@@ -53,9 +53,11 @@ jobs:
           F=$!
           python loop.py --until "$U" --lane hot &
           T=$!
-          # 3 本とも待つ。75= 走行機ごと弾かれたので抜けた(失敗にしない= 下で次の便を起こす)
+          python loop.py --until "$U" --lane w5 &
+          W=$!
+          # 4 本とも待つ(w5 は 5重勝の組だけ)。75= 走行機ごと弾かれたので抜けた(失敗にしない= 下で次の便を起こす)
           rc=0
-          for p in "$M" "$F" "$T"; do
+          for p in "$M" "$F" "$T" "$W"; do
             wait "$p" || { s=$?; [ "$s" -eq 75 ] || rc=$s; }
           done
           if [ -f .runner-blocked ]; then

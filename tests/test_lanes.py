@@ -110,7 +110,7 @@ class LoopLaneTest(unittest.TestCase):
         self.assertEqual(lane_plan("far")["every"], 120)
         self.assertEqual(lane_plan("hot")["every"], 60)
         self.assertEqual(lane_plan("morning")["every"], 1800)
-        self.assertEqual(sorted(LANES), ["all", "far", "hot", "morning"])
+        self.assertEqual(sorted(LANES), ["all", "far", "hot", "morning", "w5"])
 
     def test_default_lane_is_todays_command(self):
         # ⛔1 本で回していたときと 1 文字も変えない
